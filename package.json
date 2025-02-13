@@ -11,7 +11,8 @@
         "url": "https://github.com/pkmnct/macbid-ical/issues"
     },
     "dependencies": {
-        "ical-generator": "^5.0.1"
+        "ical-generator": "^5.0.1",
+        "macbid-ts-api": "^0.1.5"
     },
     "devDependencies": {
         "@typescript-eslint/eslint-plugin": "^5.61.0",
