@@ -31,9 +31,15 @@ dotenv.config();
           });
 
           favorites.forEach((favorite) => {
+            // Create a Date object from the UTC timestamp
+            const eventDate = new Date(favorite.expected_close_date);
+            
+            // Add one hour to compensate for the incorrect UTC timestamp
+            eventDate.setHours(eventDate.getHours() + 1);
+
             calendar.createEvent({
-              start: favorite.expected_close_date,
-              end: favorite.expected_close_date,
+              start: eventDate,
+              end: eventDate,
               summary: favorite.title,
               description: `This item is ending on Mac.bid at this time. Make sure to set a notification. The item is here: https://www.mac.bid/auction/${favorite.auction_number}/lot/${favorite.lot_number}`,
             });
