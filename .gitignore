@@ -1,6 +1,7 @@
 # Ignore compiled code
 *.d.ts
 *.js
+!eslint.config.js
 *.map
 
 # ------------- Defaults ------------- #
@@ -78,6 +79,9 @@ web_modules/
 # dotenv environment variables file
 .env
 .env.test
+
+# MacBid token persistence
+.macbid-tokens.json
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
