@@ -1,2 +1,13 @@
-node_modules
-npm-debug.log
+# Allowlist: nothing reaches the image unless it is named here, so a .env,
+# saved tokens, TLS keys, the data directory or .git in the working directory
+# can never be copied in by `COPY . .`.
+*
+
+# Package manifests
+!package.json
+!package-lock.json
+
+# Runtime files only (compiled output of the top-level .ts sources).
+# Add new modules here by name.
+!index.js
+!authStateFile.js
