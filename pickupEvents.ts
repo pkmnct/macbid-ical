@@ -1,0 +1,336 @@
+import type { ActiveItem, Building, Location } from "macbid-ts-api";
+
+const TIMEZONE = "America/New_York";
+
+const HOURS_LINE =
+  /^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+(\d{1,2}:\d{2}(?:am|pm))\s*-\s*(\d{1,2}:\d{2}(?:am|pm))$/i;
+
+export interface PickupCalendarEvent {
+  summary: string;
+  start: WallClockDateTime;
+  end: WallClockDateTime;
+  timezone: typeof TIMEZONE;
+  location: string;
+  description: string;
+}
+
+interface WallClockDateParts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}
+
+/** Stub recognized by ical-generator as a timezone-neutral wall-clock time. */
+export type WallClockDateTime = WallClockDateParts & {
+  toJSON(): string;
+  toString(): string;
+  toPlainDate(): {
+    year: number;
+    month: number;
+    day: number;
+    toJSON(): string;
+    toString(): string;
+    toPlainDateTime(): WallClockDateTime;
+  };
+  toZonedDateTime(timeZone: string): WallClockZonedDateTime;
+};
+
+type WallClockZonedDateTime = WallClockDateParts & {
+  timeZoneId: string;
+  toJSON(): string;
+  toString(): string;
+  toPlainDateTime(): WallClockDateTime;
+  withTimeZone(timeZone: string): WallClockZonedDateTime;
+};
+
+export function wallClockDateTime(
+  dateStr: string,
+  time12h: string,
+): WallClockDateTime {
+  const { hour, minute } = parseTime12h(time12h);
+  const year = parseInt(dateStr.slice(0, 4), 10);
+  const month = parseInt(dateStr.slice(5, 7), 10);
+  const day = parseInt(dateStr.slice(8, 10), 10);
+  const label = `${dateStr}T${time12h}`;
+
+  const parts: WallClockDateParts = {
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second: 0,
+  };
+
+  const plainDateTime: WallClockDateTime = {
+    ...parts,
+    toJSON: () => label,
+    toString: () => label,
+    toPlainDate: () => ({
+      year,
+      month,
+      day,
+      toJSON: () => dateStr,
+      toString: () => dateStr,
+      toPlainDateTime: () => plainDateTime,
+    }),
+    toZonedDateTime: (timeZone: string): WallClockZonedDateTime => ({
+      ...parts,
+      timeZoneId: timeZone,
+      toJSON: () => `${label}[${timeZone}]`,
+      toString: () => `${label}[${timeZone}]`,
+      toPlainDateTime: () => plainDateTime,
+      withTimeZone: (nextTimeZone: string) =>
+        plainDateTime.toZonedDateTime(nextTimeZone),
+    }),
+  };
+
+  return plainDateTime;
+}
+
+export function parseStoreHours(
+  hoursHtml: string,
+): Map<string, { open: string; close: string }> {
+  const map = new Map<string, { open: string; close: string }>();
+  const text = hoursHtml
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\r/g, "");
+
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    const match = trimmed.match(HOURS_LINE);
+    if (match) {
+      map.set(match[1]!, {
+        open: match[2]!.toLowerCase(),
+        close: match[3]!.toLowerCase(),
+      });
+    }
+  }
+
+  return map;
+}
+
+export function abandonDateInTimeZone(
+  iso: string,
+  tz: string,
+): { date: string; weekday: string } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "long",
+  }).formatToParts(new Date(iso));
+
+  const get = (type: Intl.DateTimeFormatPartTypes): string =>
+    parts.find((part) => part.type === type)?.value ?? "";
+
+  return {
+    date: `${get("year")}-${get("month")}-${get("day")}`,
+    weekday: get("weekday"),
+  };
+}
+
+export function parseTime12h(time: string): { hour: number; minute: number } {
+  const match = time
+    .trim()
+    .toLowerCase()
+    .match(/^(\d{1,2}):(\d{2})(am|pm)$/);
+  if (!match) {
+    throw new Error(`Invalid time: ${time}`);
+  }
+
+  let hour = parseInt(match[1]!, 10);
+  const minute = parseInt(match[2]!, 10);
+  if (match[3] === "pm" && hour !== 12) {
+    hour += 12;
+  }
+  if (match[3] === "am" && hour === 12) {
+    hour = 0;
+  }
+
+  return { hour, minute };
+}
+
+export function zonedLocalToDate(
+  dateStr: string,
+  time12h: string,
+  timeZone: string,
+): Date {
+  const { hour, minute } = parseTime12h(time12h);
+  const year = parseInt(dateStr.slice(0, 4), 10);
+  const month = parseInt(dateStr.slice(5, 7), 10);
+  const day = parseInt(dateStr.slice(8, 10), 10);
+
+  let utc = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+
+  const targetUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
+
+  for (let i = 0; i < 4; i++) {
+    const parts = Object.fromEntries(
+      formatter
+        .formatToParts(new Date(utc))
+        .filter((part) => part.type !== "literal")
+        .map((part) => [part.type, part.value]),
+    );
+    const actualUtc = Date.UTC(
+      parseInt(parts.year!, 10),
+      parseInt(parts.month!, 10) - 1,
+      parseInt(parts.day!, 10),
+      parseInt(parts.hour!, 10),
+      parseInt(parts.minute!, 10),
+      parseInt(parts.second!, 10),
+    );
+    utc += targetUtc - actualUtc;
+  }
+
+  return new Date(utc);
+}
+
+function addDaysInTimeZone(
+  dateStr: string,
+  days: number,
+  timeZone: string,
+): string {
+  const noon = zonedLocalToDate(dateStr, "12:00pm", timeZone);
+  const shifted = new Date(noon.getTime() + days * 86_400_000);
+  return abandonDateInTimeZone(shifted.toISOString(), timeZone).date;
+}
+
+export function resolvePickupDay(
+  abandonIso: string,
+  hoursMap: Map<string, { open: string; close: string }>,
+  tz: string,
+): {
+  date: string;
+  weekday: string;
+  hours: { open: string; close: string };
+} | null {
+  let { date, weekday } = abandonDateInTimeZone(abandonIso, tz);
+
+  for (let i = 0; i < 7; i++) {
+    const hours = hoursMap.get(weekday);
+    if (hours) {
+      return { date, weekday, hours };
+    }
+    date = addDaysInTimeZone(date, -1, tz);
+    weekday = abandonDateInTimeZone(
+      zonedLocalToDate(date, "12:00pm", tz).toISOString(),
+      tz,
+    ).weekday;
+  }
+
+  return null;
+}
+
+export function buildPickupEvents(
+  activeItems: ActiveItem[],
+  locations: Location[],
+  buildings: Building[],
+): PickupCalendarEvent[] {
+  const locationById = new Map(
+    locations.map((location) => [location.id, location]),
+  );
+  const buildingById = new Map(
+    buildings.map((building) => [building.id, building]),
+  );
+  const groups = new Map<
+    number,
+    { items: ActiveItem[]; locationIds: Set<number> }
+  >();
+
+  for (const item of activeItems) {
+    const location = locationById.get(item.current_location_id);
+    if (!location) {
+      console.warn(
+        `Unknown location ${item.current_location_id} for item ${item.id}`,
+      );
+      continue;
+    }
+
+    const group = groups.get(location.building_id) ?? {
+      items: [],
+      locationIds: new Set<number>(),
+    };
+    group.items.push(item);
+    group.locationIds.add(location.id);
+    groups.set(location.building_id, group);
+  }
+
+  const events: PickupCalendarEvent[] = [];
+
+  for (const [buildingId, { items, locationIds }] of groups) {
+    const building = buildingById.get(buildingId);
+    const locationNames = [...locationIds]
+      .map((id) => locationById.get(id)!.name)
+      .sort((a, b) => a.localeCompare(b));
+    const fallbackLocation = locationById.get([...locationIds][0]!);
+    if (!fallbackLocation) {
+      continue;
+    }
+
+    const name = building?.name ?? fallbackLocation.name;
+    const address = building
+      ? `${building.address}, ${building.city_state} ${building.zip_code}`
+      : `${fallbackLocation.address}, ${fallbackLocation.city_state} ${fallbackLocation.zip_code}`;
+    const hoursHtml = building?.hours ?? fallbackLocation.hours;
+    const hoursMap = parseStoreHours(hoursHtml);
+    if (hoursMap.size === 0) {
+      console.warn(`No hours for building ${name} (${buildingId})`);
+      continue;
+    }
+
+    const earliestAbandon = items.reduce(
+      (earliest, item) =>
+        item.auction_abandon_date < earliest
+          ? item.auction_abandon_date
+          : earliest,
+      items[0]!.auction_abandon_date,
+    );
+
+    const pickupDay = resolvePickupDay(earliestAbandon, hoursMap, TIMEZONE);
+    if (!pickupDay) {
+      console.warn(`Could not resolve pickup day for building ${name}`);
+      continue;
+    }
+
+    const warehouseSlots = items
+      .sort((a, b) => a.warehouse_location.localeCompare(b.warehouse_location))
+      .map(
+        (item) =>
+          `${item.warehouse_location} - ${item.product_name} - ${item.lot_number}`,
+      );
+    const hoursLine = `${pickupDay.weekday} ${pickupDay.hours.open} - ${pickupDay.hours.close}`;
+    const locationsLine =
+      locationNames.length > 1
+        ? `${locationNames.join(", ")}\n`
+        : locationNames.length === 1 && locationNames[0] !== name
+          ? `${locationNames[0]}\n`
+          : "";
+
+    events.push({
+      summary: `Mac.Bid Pickup: ${name}`,
+      start: wallClockDateTime(pickupDay.date, pickupDay.hours.open),
+      end: wallClockDateTime(pickupDay.date, pickupDay.hours.close),
+      timezone: TIMEZONE,
+      location: address,
+      description: `${name}\n${locationsLine}${hoursLine}\n\n${warehouseSlots.join("\n")}`,
+    });
+  }
+
+  return events;
+}

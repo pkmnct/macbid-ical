@@ -36,6 +36,21 @@ export function toAuthInfo(state: PersistedAuthState | null): Partial<AuthInfo> 
   return MacBid.parseAuthState(state);
 }
 
+export function hasPersistedTokens(state: PersistedAuthState | null): boolean {
+  return !!(state?.token || state?.refresh_token);
+}
+
+export function isRefreshTokenExpired(state: PersistedAuthState | null): boolean {
+  if (!state?.refresh_token_expiration) {
+    return !hasPersistedTokens(state);
+  }
+  return Date.now() >= new Date(state.refresh_token_expiration).getTime();
+}
+
+export function hasActiveSession(state: PersistedAuthState | null): boolean {
+  return hasPersistedTokens(state) && !isRefreshTokenExpired(state);
+}
+
 /**
  * Drop saved session when .env validation_code no longer matches what we stored.
  * - Logged in: only clear if a different code appears in .env (re-auth attempt).
@@ -65,6 +80,24 @@ export function reconcileValidationCode(
   }
 
   return { state: saved, cleared: false };
+}
+
+/** Avoid overwriting valid tokens when a re-login or code validation fails. */
+export function shouldPersistAuthState(
+  apiState: SerializableAuthState,
+  previous: PersistedAuthState | null
+): boolean {
+  const apiHasTokens = !!(apiState.token || apiState.refresh_token);
+  if (apiHasTokens) {
+    return true;
+  }
+
+  const previousHasTokens = !!(previous?.token || previous?.refresh_token);
+  if (previousHasTokens) {
+    return false;
+  }
+
+  return !!apiState.device_id;
 }
 
 export function mergePersistedAuthState(

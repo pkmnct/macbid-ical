@@ -38,3 +38,36 @@ jobs:
 
       - run: npm ci
       - run: npm run lint
+
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run docker:build
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name macbid-ical-ci -p 3000:3000 \
+            -e ICAL_UNIQUE_URL=ci-test-secret \
+            -e ICAL_URL=0.0.0.0 \
+            pkmnct/macbid-ical:latest
+          for i in $(seq 1 15); do
+            if curl -sf -o /dev/null http://127.0.0.1:3000/ci-test-secret; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs macbid-ical-ci
+          exit 1
+        shell: bash
+
+      - if: always()
+        run: docker rm -f macbid-ical-ci

@@ -12,6 +12,6 @@ RUN npm ci
 # Bundle app source
 COPY . .
 
-EXPOSE 3000
+EXPOSE 3000 3443
 
 CMD [ "npm", "start" ]

@@ -1,2 +1,27 @@
 node_modules
 npm-debug.log
+
+# Local secrets and runtime data
+.env
+.env.*
+data/
+.macbid-tokens.json
+.macbid-credentials.json
+.macbid-tls/
+
+# Git / CI
+.git
+.github
+
+# Dev caches and coverage
+.eslintcache
+*.tsbuildinfo
+coverage
+.nyc_output
+
+# OS
+.DS_Store
+
+# Local artifacts
+_app-*.js
+requestGuard.*
