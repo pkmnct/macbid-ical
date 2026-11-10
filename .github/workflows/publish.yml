@@ -29,6 +29,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # Publishing is not gated on the CI workflow, so run its checks here too.
+      # No npm audit: a new advisory must not block the weekly rebuild that
+      # ships base-image security patches (CI already reports it)
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm run typecheck
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Test exactly what is about to be published. Scheduled runs skip the

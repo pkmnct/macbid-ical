@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import MacBid, { type AuthInfo, type SerializableAuthState } from "macbid-ts-api";
+import MacBid, {
+  MacBidAuthError,
+  MacBidUnavailableError,
+  type AuthInfo,
+  type SerializableAuthState,
+} from "macbid-ts-api";
 import http from "node:http";
 import https from "node:https";
 import {
@@ -55,21 +60,19 @@ try {
   // No .env file
 }
 
+/** Wraps a failure to authenticate, so it is not confused with a failed data fetch. */
+class SignInRequiredError extends Error {
+  constructor(readonly reason: unknown) {
+    super("Mac.Bid sign-in required");
+  }
+}
+
 const errorMessage = (error: unknown): string =>
   redactSecret(error instanceof Error ? error.message : String(error));
 
 /** Mac.Bid is unreachable or failing: says nothing about whether we are signed in. */
-const isUnavailable = (error: unknown): boolean => {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return (
-    ["MacBidUnavailableError", "FetchError", "TimeoutError", "AbortError"].includes(
-      error.name
-    ) ||
-    (error instanceof TypeError && error.message === "fetch failed")
-  );
-};
+const isUnavailable = (error: unknown): boolean =>
+  error instanceof MacBidUnavailableError;
 
 function envValidationCode(): string | undefined {
   const code = process.env.MACBID_VALIDATION_CODE?.trim();
@@ -118,9 +121,7 @@ function activeEmailHint(
   }
 
   const authStateFile = authStatePath();
-  // Replaced with a fresh client when a sign-in starts over: the library keeps
-  // every field it is given, including a pending device_id or a rejected code
-  let api = new MacBid();
+  const api = new MacBid();
   const pendingCredentials = new PendingCredentials();
 
   await ensureDataDir();
@@ -158,19 +159,31 @@ function activeEmailHint(
   // Sign-in attempts are limited for the whole server, not per client: behind
   // a proxy every request comes from the same address, and there is one user.
   const LOGIN_WINDOW_MS = 15 * 60 * 1000;
-  const LOGIN_MAX_ATTEMPTS = 10;
-  const loginAttempts: number[] = [];
-  const loginRateLimited = (): boolean => {
-    const now = Date.now();
-    while (loginAttempts.length && loginAttempts[0]! < now - LOGIN_WINDOW_MS) {
-      loginAttempts.shift();
-    }
-    if (loginAttempts.length >= LOGIN_MAX_ATTEMPTS) {
-      return true;
-    }
-    loginAttempts.push(now);
-    return false;
+  // Separate budgets: each send-code texts the owner and invalidates the
+  // previous code, so it gets the tighter one, and asking for a few new codes
+  // never uses up the attempts for typing them in
+  const makeLimiter = (max: number) => {
+    const attempts: number[] = [];
+    return {
+      limited: (): boolean => {
+        const now = Date.now();
+        while (attempts.length && attempts[0]! < now - LOGIN_WINDOW_MS) {
+          attempts.shift();
+        }
+        return attempts.length >= max;
+      },
+      // Counted when the request arrives, before any await, so a burst of
+      // parallel requests cannot all pass the check
+      record: () => {
+        attempts.push(Date.now());
+      },
+      reset: () => {
+        attempts.length = 0;
+      },
+    };
   };
+  const codeLimiter = makeLimiter(10);
+  const sendCodeLimiter = makeLimiter(5);
 
   const pageOptions = (extra?: { message?: string; error?: string }) => ({
     credentialsFromEnv: hasEnvCredentials(),
@@ -270,11 +283,6 @@ function activeEmailHint(
         throw error;
       }
       await persistFromApi(api.getAuthState(), previous);
-      if (overrides.validation_code) {
-        // The client keeps a rejected code and would retry it on every later
-        // call. The pending device_id is saved, so a fresh client picks it up.
-        api = new MacBid();
-      }
       throw error;
     }
   };
@@ -333,13 +341,12 @@ function activeEmailHint(
 
         const credentials = resolveCredentials(form);
 
-        // Start from a fresh client: the current one may hold a pending
-        // device_id (the library then refuses to send another code) or a
-        // rejected code. What is saved is only replaced once Mac.Bid has
-        // accepted the email and password and sent a code.
-        const fresh = new MacBid();
+        // Start the sign-in over: a pending device_id would make the library
+        // refuse to send another code. What is saved is only replaced once
+        // Mac.Bid has accepted the email and password and sent a code.
+        api.resetSession();
         try {
-          await fresh.authenticate({
+          await api.authenticate({
             email: credentials.email,
             password: credentials.password,
           });
@@ -349,7 +356,6 @@ function activeEmailHint(
           }
         }
 
-        api = fresh;
         await persistFromApi(api.getAuthState(), null);
         if (hasPersistedTokens(persistedAuth)) {
           pendingCredentials.clear();
@@ -394,6 +400,8 @@ function activeEmailHint(
         await authenticateAndPersist({ validation_code: code }, form);
         cachedFeed = undefined;
       });
+      codeLimiter.reset();
+      sendCodeLimiter.reset();
       sendPage(res, 200, {
         message:
           "Signed in successfully. Your calendar feed will update automatically.",
@@ -421,33 +429,65 @@ function activeEmailHint(
       data = await withAuthLock(async () => {
         persistedAuth = await loadPersistedAuth();
 
+        // A code was already texted and is waiting to be typed in: logging in
+        // again would text a new one on every poll and invalidate that one
+        const awaitingCode =
+          !!persistedAuth?.device_id &&
+          !hasPersistedTokens(persistedAuth) &&
+          !envValidationCode();
         if (
           !hasActiveSession(persistedAuth) &&
-          !envCredentials() &&
-          !pendingCredentials.get()
+          (awaitingCode || (!envCredentials() && !pendingCredentials.get()))
         ) {
           return null;
         }
 
-        await authenticateAndPersist();
-        const [favorites, activeItems, locations, buildings] =
-          await Promise.all([
+        try {
+          await authenticateAndPersist();
+        } catch (error) {
+          throw new SignInRequiredError(error);
+        }
+        let fetched;
+        try {
+          fetched = await Promise.all([
             api.get_watchlist(),
             api.get_active(),
             api.get_locations(),
             api.get_buildings(),
           ]);
+        } catch (error) {
+          if (error instanceof MacBidAuthError) {
+            // The library has dropped the session; forget the saved copy too,
+            // or the sign-in page would keep reporting it as active and refuse
+            // to send a new code
+            await clearAuthStateFile(authStateFile);
+            persistedAuth = null;
+            throw new SignInRequiredError(error);
+          }
+          throw error;
+        }
+        const [favorites, activeItems, locations, buildings] = fetched;
         await persistFromApi(api.getAuthState());
         const refreshTokenExpiration = await api.get_refresh_token_expiration();
-        return { favorites, activeItems, locations, buildings, refreshTokenExpiration };
+        return {
+          favorites,
+          activeItems,
+          locations,
+          buildings,
+          refreshTokenExpiration,
+        };
       });
     } catch (error) {
-      if (isUnavailable(error)) {
-        // An outage is not a sign-out: fail the request so calendar apps keep
-        // what they have, instead of replacing it with a sign-in reminder
+      // Only a failed sign-in becomes the sign-in reminder. Anything else (a
+      // bad response, a bug) fails the request, so calendar apps keep what they
+      // have instead of replacing it with a misleading reminder
+      if (!(error instanceof SignInRequiredError)) {
         throw error;
       }
-      return authRequiredFeed(error);
+      if (isUnavailable(error.reason)) {
+        throw error.reason;
+      }
+      return authRequiredFeed(error.reason);
     }
 
     if (!data) {
@@ -485,7 +525,7 @@ function activeEmailHint(
       data.buildings
     )) {
       const pickupKey = createHash("sha256")
-        .update(`${event.summary}|${event.location}`)
+        .update(`${event.summary}|${event.location}|${event.start.toISOString()}`)
         .digest("hex")
         .slice(0, 16);
 
@@ -542,10 +582,12 @@ function activeEmailHint(
     return value?.split(",")[0]?.trim().toLowerCase() === "https";
   };
 
-  // Behind nginx: ICAL_PUBLIC_URL is set and TLS is terminated at the proxy.
-  // Serve login on the HTTP port instead of redirecting back to the public URL.
+  // Behind nginx: TLS is terminated at the proxy, which is set up by naming its
+  // public URL (ICAL_PUBLIC_URL) and sends X-Forwarded-Proto: https. Both are
+  // required, so a request that reaches the HTTP port directly (no header) never
+  // gets the sign-in form in cleartext, and the header alone is not trusted.
   const serveLoginOnHttpPort = (req: http.IncomingMessage): boolean =>
-    publicUrlConfigured || proxiedHttps(req);
+    publicUrlConfigured && proxiedHttps(req);
 
   const redirectLoginToHttps = (
     req: http.IncomingMessage,
@@ -569,7 +611,8 @@ function activeEmailHint(
     req: http.IncomingMessage,
     res: http.ServerResponse
   ): void => {
-    if (req.method === "POST" && loginRateLimited()) {
+    const limiter = route === "login" ? codeLimiter : sendCodeLimiter;
+    if (req.method === "POST" && limiter.limited()) {
       console.warn("Too many sign-in attempts; refusing for now");
       res.writeHead(429, {
         "Content-Type": "text/plain; charset=utf-8",
@@ -577,6 +620,9 @@ function activeEmailHint(
       });
       res.end("Too many sign-in attempts. Try again in a few minutes.\n");
       return;
+    }
+    if (req.method === "POST") {
+      limiter.record();
     }
 
     if (route === "login") {
@@ -652,6 +698,13 @@ function activeEmailHint(
       if (route === "login" || route === "login-send-code") {
         if (serveLoginOnHttpPort(req)) {
           handleLoginRoute(route, req, res);
+        } else if (publicUrlConfigured && !proxiedHttps(req)) {
+          // Redirecting would send a proxy that omits the header round in circles
+          res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end(
+            "Sign-in needs HTTPS. If this is a reverse proxy, make it send " +
+              "X-Forwarded-Proto: https; otherwise use the HTTPS sign-in port.\n"
+          );
         } else if (tls) {
           redirectLoginToHttps(req, res);
         } else {

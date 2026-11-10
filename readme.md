@@ -110,7 +110,7 @@ data/
   tls/           # self-signed cert for the sign-in page
 ```
 
-For production behind nginx, set `ICAL_PUBLIC_URL` and proxy everything to port `3000`; the sign-in page is served there when `ICAL_PUBLIC_URL` is set.
+For production behind nginx, set `ICAL_PUBLIC_URL` and proxy everything to port `3000`; the sign-in page is served there only when `ICAL_PUBLIC_URL` is set **and** the proxy sends `X-Forwarded-Proto: https`. Requests that reach port `3000` directly are redirected to the HTTPS port instead, so the form is never served in cleartext.
 
 In `docker-compose.yml`, always quote URLs — YAML treats `//` as a comment, so an unquoted `https://example.com:8443` becomes `https:/` inside the container:
 
@@ -132,7 +132,7 @@ location / {
 }
 ```
 
-Do **not** proxy login to port `3000` without `X-Forwarded-Proto` on older images. Current versions also skip the redirect when `ICAL_PUBLIC_URL` is set (TLS terminated at nginx).
+Always set `X-Forwarded-Proto` when proxying: without it the sign-in page is not served on port `3000`.
 
 For 2FA in Docker, mount the `data` folder and open `https://<your public host>/<ICAL_UNIQUE_URL>/login` through the proxy.
 

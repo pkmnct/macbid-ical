@@ -234,9 +234,6 @@ export function buildPickupEvents(
 
   for (const [buildingId, { items, locationIds }] of groups) {
     const building = buildingById.get(buildingId);
-    const locationNames = [...locationIds]
-      .map((id) => locationById.get(id)!.name)
-      .sort((a, b) => a.localeCompare(b));
     const fallbackLocation = locationById.get([...locationIds][0]!);
     if (!fallbackLocation) {
       continue;
@@ -253,43 +250,65 @@ export function buildPickupEvents(
       continue;
     }
 
-    const earliestAbandon = items.reduce(
-      (earliest, item) =>
-        item.auction_abandon_date < earliest
-          ? item.auction_abandon_date
-          : earliest,
-      items[0]!.auction_abandon_date,
-    );
-
-    const pickupDay = resolvePickupDay(earliestAbandon, hoursMap, TIMEZONE);
-    if (!pickupDay) {
-      console.warn(`Could not resolve pickup day for building ${name}`);
-      continue;
+    // One event per pickup day. Items abandoned at different times can share a
+    // day: they share its event (the id is derived from its start), and the
+    // window ends at the earliest abandonment so it is right for every item.
+    type PickupDay = NonNullable<ReturnType<typeof resolvePickupDay>>;
+    const days = new Map<
+      string,
+      { pickupDay: PickupDay; dayItems: ActiveItem[]; dayLocationIds: Set<number> }
+    >();
+    for (const item of items) {
+      const pickupDay = resolvePickupDay(
+        item.auction_abandon_date,
+        hoursMap,
+        TIMEZONE,
+      );
+      if (!pickupDay) {
+        console.warn(`Could not resolve pickup day for building ${name}`);
+        continue;
+      }
+      const day = days.get(pickupDay.date) ?? {
+        pickupDay,
+        dayItems: [],
+        dayLocationIds: new Set<number>(),
+      };
+      if (pickupDay.end < day.pickupDay.end) {
+        day.pickupDay = pickupDay;
+      }
+      day.dayItems.push(item);
+      day.dayLocationIds.add(item.current_location_id);
+      days.set(pickupDay.date, day);
     }
 
-    const warehouseSlots = items
-      .sort((a, b) => a.warehouse_location.localeCompare(b.warehouse_location))
-      .map(
-        (item) =>
-          `${item.warehouse_location} - ${item.product_name} - ${item.lot_number}`,
-      );
-    const hoursLine = pickupDay.endsAtAbandon
-      ? `${pickupDay.weekday} ${pickupDay.hours.open} - ${formatTime12h(pickupDay.end, TIMEZONE)} (items are abandoned then; store closes ${pickupDay.hours.close})`
-      : `${pickupDay.weekday} ${pickupDay.hours.open} - ${pickupDay.hours.close}`;
-    const locationsLine =
-      locationNames.length > 1
-        ? `${locationNames.join(", ")}\n`
-        : locationNames.length === 1 && locationNames[0] !== name
-          ? `${locationNames[0]}\n`
-          : "";
+    for (const { pickupDay, dayItems, dayLocationIds } of days.values()) {
+      const locationNames = [...dayLocationIds]
+        .map((id) => locationById.get(id)!.name)
+        .sort((a, b) => a.localeCompare(b));
+      const warehouseSlots = dayItems
+        .sort((a, b) => a.warehouse_location.localeCompare(b.warehouse_location))
+        .map(
+          (item) =>
+            `${item.warehouse_location} - ${item.product_name} - ${item.lot_number}`,
+        );
+      const hoursLine = pickupDay.endsAtAbandon
+        ? `${pickupDay.weekday} ${pickupDay.hours.open} - ${formatTime12h(pickupDay.end, TIMEZONE)} (items are abandoned then; store closes ${pickupDay.hours.close})`
+        : `${pickupDay.weekday} ${pickupDay.hours.open} - ${pickupDay.hours.close}`;
+      const locationsLine =
+        locationNames.length > 1
+          ? `${locationNames.join(", ")}\n`
+          : locationNames.length === 1 && locationNames[0] !== name
+            ? `${locationNames[0]}\n`
+            : "";
 
-    events.push({
-      summary: `Mac.Bid Pickup: ${name}`,
-      start: pickupDay.start,
-      end: pickupDay.end,
-      location: address,
-      description: `${name}\n${locationsLine}${hoursLine}\n\n${warehouseSlots.join("\n")}`,
-    });
+      events.push({
+        summary: `Mac.Bid Pickup: ${name}`,
+        start: pickupDay.start,
+        end: pickupDay.end,
+        location: address,
+        description: `${name}\n${locationsLine}${hoursLine}\n\n${warehouseSlots.join("\n")}`,
+      });
+    }
   }
 
   return events;

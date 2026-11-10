@@ -13,11 +13,20 @@ export interface TlsMaterials {
  * and openssl is not available (as in the published Docker image).
  */
 export function loadTlsMaterials(dir: string): TlsMaterials | null {
-  const certPath =
-    process.env.ICAL_TLS_CERT?.trim() || join(dir, "cert.pem");
-  const keyPath = process.env.ICAL_TLS_KEY?.trim() || join(dir, "key.pem");
+  const configuredCert = process.env.ICAL_TLS_CERT?.trim();
+  const configuredKey = process.env.ICAL_TLS_KEY?.trim();
+  const certPath = configuredCert || join(dir, "cert.pem");
+  const keyPath = configuredKey || join(dir, "key.pem");
 
-  if (!existsSync(certPath) || !existsSync(keyPath)) {
+  // A certificate the user named must exist: never replace it with a
+  // generated one, or hide the mistake by turning HTTPS off
+  if (configuredCert || configuredKey) {
+    if (!existsSync(certPath) || !existsSync(keyPath)) {
+      throw new Error(
+        `ICAL_TLS_CERT and ICAL_TLS_KEY must both point to existing files (cert: ${certPath}, key: ${keyPath})`
+      );
+    }
+  } else if (!existsSync(certPath) || !existsSync(keyPath)) {
     try {
       mkdirSync(dir, { recursive: true });
       execFileSync(

@@ -30,12 +30,13 @@ docker run -d --name "$name" --network "$network" \
 
 # The image has no shell or curl, so probe it with node from inside the container.
 # Prints the status code, then the body.
+# Set NO_PROXY_HEADER=1 to leave out the X-Forwarded-Proto header a proxy adds.
 probe() {
-  docker exec "$name" /nodejs/bin/node -e '
+  docker exec -e NO_PROXY_HEADER="${NO_PROXY_HEADER:-}" "$name" /nodejs/bin/node -e '
     const [method, path, body] = process.argv.slice(1);
     const req = require("node:http").request(
       { host: "127.0.0.1", port: 3000, method, path, timeout: 20000,
-        headers: body ? { "Content-Type": "application/x-www-form-urlencoded" } : {} },
+        headers: { ...(process.env.NO_PROXY_HEADER ? {} : { "X-Forwarded-Proto": "https" }), ...(body ? { "Content-Type": "application/x-www-form-urlencoded" } : {}) } },
       (res) => { let out = ""; res.on("data", (d) => (out += d)); res.on("end", () => console.log(res.statusCode + "\n" + out)); }
     );
     req.on("error", () => console.log("closed"));
@@ -75,6 +76,11 @@ echo "ok   feed is the sign-in required calendar"
 page="$(probe GET "/$secret/login")"
 expect "sign-in page is served behind a proxy" "200" "$(echo "$page" | head -n 1)"
 echo "$page" | grep -q "<form" || fail "sign-in page has no form"
+
+# Straight to the HTTP port, not through the proxy: never serve the form in cleartext
+direct="$(NO_PROXY_HEADER=1 probe GET "/$secret/login")"
+expect "sign-in is refused without the proxy header" "400" "$(echo "$direct" | head -n 1)"
+if echo "$direct" | grep -q "<form"; then fail "sign-in form served without the proxy header"; fi
 
 expect "empty code is rejected" "400" "$(status POST "/$secret/login" "code=")"
 for _ in $(seq 1 9); do status POST "/$secret/login" "code=" >/dev/null; done
