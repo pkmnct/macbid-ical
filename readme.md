@@ -100,7 +100,7 @@ docker run -d \
 
 The image is distroless (no shell, package manager or `openssl`), runs as a non-root user (uid 65532) and writes only to the data directory. On Linux, make the mounted folder writable by that user (`chown 65532 macbid-data`). Nothing from the build machine's working directory is copied in except the source files: `.dockerignore` is an allowlist.
 
-Because the image has no `openssl`, it cannot generate the self-signed certificate. The HTTPS sign-in port (`3443`) is only opened when a certificate already exists in `data/tls/` or `ICAL_TLS_CERT` / `ICAL_TLS_KEY` point at one. Otherwise sign in through a TLS-terminating proxy with `ICAL_PUBLIC_URL` set.
+Because the image has no `openssl`, it cannot generate the self-signed certificate. The HTTPS sign-in port (`3443`) is only opened when a certificate already exists in `data/tls/` or `ICAL_TLS_CERT` / `ICAL_TLS_KEY` point at one. Otherwise sign in through a TLS-terminating proxy with `ICAL_PUBLIC_URL` set. With neither, sign-in is turned off: the sign-in URL answers `503` with these instructions rather than redirecting to a port that is not listening.
 
 Persistent files in the data directory:
 

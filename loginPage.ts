@@ -154,6 +154,8 @@ export function loginPageModel(
   auth: PersistedAuthState | null,
   options: {
     credentialsFromEnv: boolean;
+    /** Email and password from "send code" are still held in memory. */
+    hasPendingCredentials: boolean;
     configuredEmail?: string;
     message?: string;
     error?: string;
@@ -176,8 +178,12 @@ export function loginPageModel(
     loginUrl,
     sendCodeUrl: `${loginUrl}/send-code`,
     status,
+    // While a code is pending the server reuses the email and password from
+    // "send code", unless it restarted or they timed out: then ask again.
     showCredentialFields:
-      !options.credentialsFromEnv && status !== "authenticated",
+      !options.credentialsFromEnv &&
+      status !== "authenticated" &&
+      !(status === "pending" && options.hasPendingCredentials),
     configuredEmail: options.configuredEmail,
     refreshExpires: formatExpiry(auth?.refresh_token_expiration),
     message: options.message,
@@ -223,8 +229,12 @@ export function renderLoginPage(model: LoginPageModel): string {
     if (model.configuredEmail) {
       body += `<p class="muted">Account: ${escapeHtml(model.configuredEmail)}</p>`;
     }
-    body += `<p>Enter the verification code sent to your phone.</p>`;
-    body += codeForm(model.loginUrl);
+    if (model.showCredentialFields) {
+      body += `<p>Enter the verification code sent to your phone, with your Mac.Bid email and password.</p>`;
+    } else {
+      body += `<p>Enter the verification code sent to your phone.</p>`;
+    }
+    body += codeForm(model);
     body += `<p class="muted">Didn't get a code? Request a new one below (this invalidates the previous code).</p>`;
     body += sendCodeForm(model, "Send new verification code");
   } else {
@@ -328,8 +338,16 @@ export function renderLoginPage(model: LoginPageModel): string {
 </html>`;
 }
 
-function codeForm(action: string): string {
-  return `<form method="post" action="${escapeHtml(action)}">
+function credentialFields(idPrefix: string): string {
+  return `<label for="${idPrefix}email">Mac.Bid email</label>
+  <input id="${idPrefix}email" name="email" type="email" autocomplete="username" required>
+  <label for="${idPrefix}password">Password</label>
+  <input id="${idPrefix}password" name="password" type="password" autocomplete="current-password" required>`;
+}
+
+function codeForm(model: LoginPageModel): string {
+  return `<form method="post" action="${escapeHtml(model.loginUrl)}">
+  ${model.showCredentialFields ? credentialFields("code-") : ""}
   <label for="code">Verification code</label>
   <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" maxlength="8" required autofocus>
   <button type="submit">Sign in</button>
@@ -339,10 +357,7 @@ function codeForm(action: string): string {
 function sendCodeForm(model: LoginPageModel, label: string): string {
   if (model.showCredentialFields) {
     return `<form method="post" action="${escapeHtml(model.sendCodeUrl)}">
-  <label for="email">Mac.Bid email</label>
-  <input id="email" name="email" type="email" autocomplete="username" required>
-  <label for="password">Password</label>
-  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  ${credentialFields("")}
   <button type="submit">${escapeHtml(label)}</button>
 </form>`;
   }

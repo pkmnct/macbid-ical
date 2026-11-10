@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import MacBid, { type AuthInfo, type SerializableAuthState } from "macbid-ts-api";
 import http from "node:http";
 import https from "node:https";
-import { unlink } from "node:fs/promises";
 import {
   clearAuthStateFile,
   hasActiveSession,
+  hasPersistedTokens,
   loadAuthStateFile,
   mergePersistedAuthState,
   reconcileValidationCode,
@@ -23,6 +23,7 @@ import {
   type MacbidCredentials,
 } from "./credentialsFile.js";
 import {
+  feedPublicBaseUrl,
   loginPageModel,
   loginPageUrl,
   loginRedirectUrl,
@@ -41,7 +42,7 @@ import { buildPickupEvents } from "./pickupEvents.js";
 import {
   authStatePath,
   ensureDataDir,
-  legacyCredentialsPath,
+  migrateLegacyFiles,
   tlsDir,
 } from "./dataDir.js";
 import { loadTlsMaterials } from "./tls.js";
@@ -75,8 +76,20 @@ function envValidationCode(): string | undefined {
   return code || undefined;
 }
 
-function hasValidTokens(state: PersistedAuthState | null): boolean {
-  return hasActiveSession(state);
+function cacheSecondsFromEnv(): number {
+  const DEFAULT = 300;
+  const raw = process.env.ICAL_CACHE_SECONDS?.trim();
+  if (!raw) {
+    return DEFAULT;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    console.warn(
+      `ICAL_CACHE_SECONDS must be a number of seconds (got ${JSON.stringify(raw)}); using ${DEFAULT}.`
+    );
+    return DEFAULT;
+  }
+  return value;
 }
 
 function activeEmailHint(
@@ -105,13 +118,22 @@ function activeEmailHint(
   }
 
   const authStateFile = authStatePath();
-  const legacyCredentialsFile = legacyCredentialsPath();
-  const tlsPath = tlsDir();
-  const api = new MacBid();
+  // Replaced with a fresh client when a sign-in starts over: the library keeps
+  // every field it is given, including a pending device_id or a rejected code
+  let api = new MacBid();
   const pendingCredentials = new PendingCredentials();
 
   await ensureDataDir();
-  await unlink(legacyCredentialsFile).catch(() => undefined);
+  await migrateLegacyFiles();
+
+  const tls = loadTlsMaterials(tlsDir());
+  const publicUrlConfigured = !!process.env.ICAL_PUBLIC_URL?.trim();
+  // Without a certificate or a TLS proxy there is nowhere safe to sign in
+  const signInAvailable = !!tls || publicUrlConfigured;
+  const signInUrl = (): string =>
+    signInAvailable
+      ? loginPageUrl()
+      : `${feedPublicBaseUrl()}/${feedSecret}/login`;
 
   interface FeedResult {
     /** False when the body is the "sign-in required" placeholder calendar. */
@@ -119,11 +141,19 @@ function activeEmailHint(
     body: string;
   }
 
-  const cacheSeconds = process.env.ICAL_CACHE_SECONDS
-    ? parseInt(process.env.ICAL_CACHE_SECONDS, 10)
-    : 300;
+  const cacheSeconds = cacheSecondsFromEnv();
   let cachedFeed: { body: string; expires: number } | undefined;
   let pendingFeed: Promise<FeedResult> | undefined;
+
+  // Feed builds, sign-in and startup all share one Mac.Bid client and the
+  // saved auth state. Run them one at a time so none sees another's half-done
+  // state or saves over it.
+  let authQueue: Promise<unknown> = Promise.resolve();
+  const withAuthLock = <T>(task: () => Promise<T>): Promise<T> => {
+    const run = authQueue.then(task);
+    authQueue = run.catch(() => undefined);
+    return run;
+  };
 
   // Sign-in attempts are limited for the whole server, not per client: behind
   // a proxy every request comes from the same address, and there is one user.
@@ -144,6 +174,7 @@ function activeEmailHint(
 
   const pageOptions = (extra?: { message?: string; error?: string }) => ({
     credentialsFromEnv: hasEnvCredentials(),
+    hasPendingCredentials: !!pendingCredentials.get(),
     configuredEmail: activeEmailHint(envCredentials(), pendingCredentials),
     ...extra,
   });
@@ -178,24 +209,18 @@ function activeEmailHint(
     await saveAuthStateFile(authStateFile, persistedAuth);
   };
 
+  /** Env credentials, then ones typed in the form, then ones kept from "send code". */
   const resolveCredentials = (form?: URLSearchParams): MacbidCredentials => {
-    const fromEnv = envCredentials();
-    if (fromEnv) {
-      return fromEnv;
+    const credentials =
+      envCredentials() ??
+      (form ? credentialsFromForm(form) : null) ??
+      pendingCredentials.get();
+    if (!credentials) {
+      throw new Error(
+        "Enter your Mac.Bid email and password along with the code (the server no longer has them)."
+      );
     }
-
-    const fromForm = form ? credentialsFromForm(form) : null;
-    if (fromForm) {
-      pendingCredentials.set(fromForm);
-      return fromForm;
-    }
-
-    const pending = pendingCredentials.get();
-    if (pending) {
-      return pending;
-    }
-
-    throw new Error("Mac.Bid email and password are required.");
+    return credentials;
   };
 
   const buildAuthParams = (
@@ -227,6 +252,7 @@ function activeEmailHint(
     return params;
   };
 
+  /** Call only inside withAuthLock. */
   const authenticateAndPersist = async (
     overrides: Partial<AuthInfo> = {},
     form?: URLSearchParams
@@ -235,7 +261,7 @@ function activeEmailHint(
     try {
       await api.authenticate(buildAuthParams(overrides, form));
       await persistFromApi(api.getAuthState(), previous);
-      if (hasValidTokens(persistedAuth)) {
+      if (hasActiveSession(persistedAuth)) {
         pendingCredentials.clear();
       }
     } catch (error) {
@@ -244,6 +270,11 @@ function activeEmailHint(
         throw error;
       }
       await persistFromApi(api.getAuthState(), previous);
+      if (overrides.validation_code) {
+        // The client keeps a rejected code and would retry it on every later
+        // call. The pending device_id is saved, so a fresh client picks it up.
+        api = new MacBid();
+      }
       throw error;
     }
   };
@@ -262,13 +293,29 @@ function activeEmailHint(
     res.end(html);
   };
 
-  const handleLoginGet = async (res: http.ServerResponse) => {
-    persistedAuth = await loadPersistedAuth();
+  const sendPage = (
+    res: http.ServerResponse,
+    status: number,
+    extra?: { message?: string; error?: string }
+  ) => {
     sendHtml(
       res,
-      200,
-      renderLoginPage(loginPageModel(persistedAuth, pageOptions()))
+      status,
+      renderLoginPage(loginPageModel(persistedAuth, pageOptions(extra)))
     );
+  };
+
+  const handleLoginGet = async (res: http.ServerResponse) => {
+    try {
+      await withAuthLock(async () => {
+        persistedAuth = await loadPersistedAuth();
+      });
+      sendPage(res, 200);
+    } catch (error) {
+      console.error("Could not render the sign-in page:", errorMessage(error));
+      res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Could not render the sign-in page\n");
+    }
   };
 
   const handleSendCode = async (
@@ -276,63 +323,54 @@ function activeEmailHint(
     res: http.ServerResponse
   ) => {
     try {
-      persistedAuth = await loadPersistedAuth();
       const form = await readUrlEncodedForm(req);
 
-      if (hasValidTokens(persistedAuth)) {
-        sendHtml(
-          res,
-          200,
-          renderLoginPage(
-            loginPageModel(persistedAuth, pageOptions({
-              message: "Already signed in. No verification code was sent.",
-            }))
-          )
-        );
-        return;
-      }
+      const message = await withAuthLock(async () => {
+        persistedAuth = await loadPersistedAuth();
+        if (hasActiveSession(persistedAuth)) {
+          return "Already signed in. No verification code was sent.";
+        }
 
-      await resolveCredentials(form);
+        const credentials = resolveCredentials(form);
 
-      await clearAuthStateFile(authStateFile);
-      persistedAuth = null;
-      await authenticateAndPersist({}, form);
-      sendHtml(
-        res,
-        200,
-        renderLoginPage(
-          loginPageModel(persistedAuth, pageOptions({
-            message: "Verification code sent. Check your phone.",
-          }))
-        )
-      );
+        // Start from a fresh client: the current one may hold a pending
+        // device_id (the library then refuses to send another code) or a
+        // rejected code. What is saved is only replaced once Mac.Bid has
+        // accepted the email and password and sent a code.
+        const fresh = new MacBid();
+        try {
+          await fresh.authenticate({
+            email: credentials.email,
+            password: credentials.password,
+          });
+        } catch (error) {
+          if (!validationCodeSentMessage(error)) {
+            throw error;
+          }
+        }
+
+        api = fresh;
+        await persistFromApi(api.getAuthState(), null);
+        if (hasPersistedTokens(persistedAuth)) {
+          pendingCredentials.clear();
+          cachedFeed = undefined;
+          return "Signed in successfully. Your calendar feed will update automatically.";
+        }
+        if (!hasEnvCredentials()) {
+          pendingCredentials.set(credentials);
+        }
+        return "Verification code sent. Check your phone.";
+      });
+
+      sendPage(res, 200, { message });
     } catch (error) {
-      if (validationCodeSentMessage(error)) {
-        sendHtml(
-          res,
-          200,
-          renderLoginPage(
-            loginPageModel(persistedAuth, pageOptions({
-              message: "Verification code sent. Check your phone.",
-            }))
-          )
-        );
-        return;
-      }
-
       console.error("Failed to send verification code:", errorMessage(error));
-      sendHtml(
-        res,
-        500,
-        renderLoginPage(
-          loginPageModel(persistedAuth, pageOptions({
-            error:
-              error instanceof Error
-                ? error.message
-                : "Failed to send verification code.",
-          }))
-        )
-      );
+      sendPage(res, isUnavailable(error) ? 502 : 400, {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Failed to send verification code.",
+      });
     }
   };
 
@@ -341,124 +379,68 @@ function activeEmailHint(
     res: http.ServerResponse
   ) => {
     try {
-      persistedAuth = await loadPersistedAuth();
       const form = await readUrlEncodedForm(req);
       const code = form.get("code")?.trim();
 
       if (!code) {
-        sendHtml(
-          res,
-          400,
-          renderLoginPage(
-            loginPageModel(persistedAuth, pageOptions({
-              error: "Enter the verification code from your phone.",
-            }))
-          )
-        );
+        sendPage(res, 400, {
+          error: "Enter the verification code from your phone.",
+        });
         return;
       }
 
-      await authenticateAndPersist({ validation_code: code }, form);
-      cachedFeed = undefined;
-      sendHtml(
-        res,
-        200,
-        renderLoginPage(
-          loginPageModel(persistedAuth, pageOptions({
-            message:
-              "Signed in successfully. Your calendar feed will update automatically.",
-          }))
-        )
-      );
+      await withAuthLock(async () => {
+        persistedAuth = await loadPersistedAuth();
+        await authenticateAndPersist({ validation_code: code }, form);
+        cachedFeed = undefined;
+      });
+      sendPage(res, 200, {
+        message:
+          "Signed in successfully. Your calendar feed will update automatically.",
+      });
     } catch (error) {
       console.error("Login failed:", errorMessage(error));
-      sendHtml(
-        res,
-        400,
-        renderLoginPage(
-          loginPageModel(persistedAuth, pageOptions({
-            error:
-              error instanceof Error ? error.message : "Sign-in failed.",
-          }))
-        )
-      );
+      sendPage(res, 400, {
+        error: error instanceof Error ? error.message : "Sign-in failed.",
+      });
     }
   };
 
   const authRequiredFeed = (reason: unknown): FeedResult => {
     console.error("Serving sign-in required calendar:", errorMessage(reason));
     const calendar = createMacbidCalendar();
-    addAuthRequiredEvent(calendar, loginPageUrl());
+    addAuthRequiredEvent(calendar, signInUrl());
     return { signedIn: false, body: calendar.toString() };
   };
 
   const buildFeed = async (): Promise<FeedResult> => {
-    const renewUrl = loginPageUrl();
-    persistedAuth = await loadPersistedAuth();
+    const renewUrl = signInUrl();
 
-    if (
-      !hasActiveSession(persistedAuth) &&
-      !envCredentials() &&
-      !pendingCredentials.get()
-    ) {
-      return authRequiredFeed("No active session and no credentials configured");
-    }
-
+    let data;
     try {
-      await authenticateAndPersist();
+      data = await withAuthLock(async () => {
+        persistedAuth = await loadPersistedAuth();
 
-      const [favorites, activeItems, locations, buildings] = await Promise.all([
-        api.get_watchlist(),
-        api.get_active(),
-        api.get_locations(),
-        api.get_buildings(),
-      ]);
-      await persistFromApi(api.getAuthState());
-      const refresh_token_expiration = await api.get_refresh_token_expiration();
+        if (
+          !hasActiveSession(persistedAuth) &&
+          !envCredentials() &&
+          !pendingCredentials.get()
+        ) {
+          return null;
+        }
 
-      const calendar = createMacbidCalendar();
-
-      // Stable ids let calendar apps update an event instead of duplicating it
-      calendar.createEvent({
-        id: "macbid-reauthentication",
-        start: refresh_token_expiration,
-        end: refresh_token_expiration,
-        summary: "Mac.Bid Calendar Reauthentication Required",
-        description: `Your Mac.Bid session for this calendar expires around this time. Sign in to renew:\n${renewUrl}`,
-        url: renewUrl,
+        await authenticateAndPersist();
+        const [favorites, activeItems, locations, buildings] =
+          await Promise.all([
+            api.get_watchlist(),
+            api.get_active(),
+            api.get_locations(),
+            api.get_buildings(),
+          ]);
+        await persistFromApi(api.getAuthState());
+        const refreshTokenExpiration = await api.get_refresh_token_expiration();
+        return { favorites, activeItems, locations, buildings, refreshTokenExpiration };
       });
-
-      favorites.forEach((favorite) => {
-        const eventDate = new Date(favorite.expected_close_date);
-        eventDate.setHours(eventDate.getHours() + 1);
-
-        calendar.createEvent({
-          id: `macbid-watchlist-${favorite.auction_lot_id}`,
-          start: eventDate,
-          end: eventDate,
-          summary: favorite.title,
-          description: `This item is ending on Mac.bid at this time. Make sure to set a notification. The item is here: https://www.mac.bid/auction/${favorite.auction_number}/lot/${favorite.lot_number}`,
-        });
-      });
-
-      for (const event of buildPickupEvents(activeItems, locations, buildings)) {
-        const pickupKey = createHash("sha256")
-          .update(`${event.summary}|${event.location}`)
-          .digest("hex")
-          .slice(0, 16);
-
-        calendar.createEvent({
-          id: `macbid-pickup-${pickupKey}`,
-          summary: event.summary,
-          start: event.start,
-          end: event.end,
-          timezone: event.timezone,
-          location: event.location,
-          description: event.description,
-        });
-      }
-
-      return { signedIn: true, body: calendar.toString() };
     } catch (error) {
       if (isUnavailable(error)) {
         // An outage is not a sign-out: fail the request so calendar apps keep
@@ -467,6 +449,57 @@ function activeEmailHint(
       }
       return authRequiredFeed(error);
     }
+
+    if (!data) {
+      return authRequiredFeed("No active session and no credentials configured");
+    }
+
+    const calendar = createMacbidCalendar();
+
+    // Stable ids let calendar apps update an event instead of duplicating it
+    calendar.createEvent({
+      id: "macbid-reauthentication",
+      start: data.refreshTokenExpiration,
+      end: data.refreshTokenExpiration,
+      summary: "Mac.Bid Calendar Reauthentication Required",
+      description: `Your Mac.Bid session for this calendar expires around this time. Sign in to renew:\n${renewUrl}`,
+      url: renewUrl,
+    });
+
+    data.favorites.forEach((favorite) => {
+      const eventDate = new Date(favorite.expected_close_date);
+      eventDate.setHours(eventDate.getHours() + 1);
+
+      calendar.createEvent({
+        id: `macbid-watchlist-${favorite.auction_lot_id}`,
+        start: eventDate,
+        end: eventDate,
+        summary: favorite.title,
+        description: `This item is ending on Mac.bid at this time. Make sure to set a notification. The item is here: https://www.mac.bid/auction/${favorite.auction_number}/lot/${favorite.lot_number}`,
+      });
+    });
+
+    for (const event of buildPickupEvents(
+      data.activeItems,
+      data.locations,
+      data.buildings
+    )) {
+      const pickupKey = createHash("sha256")
+        .update(`${event.summary}|${event.location}`)
+        .digest("hex")
+        .slice(0, 16);
+
+      calendar.createEvent({
+        id: `macbid-pickup-${pickupKey}`,
+        summary: event.summary,
+        start: event.start,
+        end: event.end,
+        location: event.location,
+        description: event.description,
+      });
+    }
+
+    return { signedIn: true, body: calendar.toString() };
   };
 
   // Each build is a session check plus four Mac.Bid requests. Share one build
@@ -512,7 +545,7 @@ function activeEmailHint(
   // Behind nginx: ICAL_PUBLIC_URL is set and TLS is terminated at the proxy.
   // Serve login on the HTTP port instead of redirecting back to the public URL.
   const serveLoginOnHttpPort = (req: http.IncomingMessage): boolean =>
-    !!process.env.ICAL_PUBLIC_URL?.trim() || proxiedHttps(req);
+    publicUrlConfigured || proxiedHttps(req);
 
   const redirectLoginToHttps = (
     req: http.IncomingMessage,
@@ -520,6 +553,15 @@ function activeEmailHint(
   ) => {
     res.writeHead(307, { Location: loginRedirectUrl(req.url) });
     res.end();
+  };
+
+  const refuseLoginWithoutHttps = (res: http.ServerResponse) => {
+    res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end(
+      "Sign-in is turned off: it needs HTTPS, and this server has no TLS certificate.\n" +
+        "Put it behind a TLS-terminating proxy and set ICAL_PUBLIC_URL, " +
+        "or set ICAL_TLS_CERT and ICAL_TLS_KEY.\n"
+    );
   };
 
   const handleLoginRoute = (
@@ -558,22 +600,28 @@ function activeEmailHint(
   };
 
   console.log(`macbid-ical v${appVersion}`);
+  if (!signInAvailable) {
+    console.error(
+      "No TLS certificate and no openssl to make one, and ICAL_PUBLIC_URL is not set: sign-in is turned off. " +
+        "Sign in through a TLS-terminating proxy (set ICAL_PUBLIC_URL), or set ICAL_TLS_CERT and ICAL_TLS_KEY."
+    );
+  }
   console.log("Authenticating on startup...");
   if (!hasActiveSession(persistedAuth) && !envCredentials()) {
     console.log(
       "No active Mac.Bid session. Sign in at:",
-      redactSecret(loginPageUrl())
+      redactSecret(signInUrl())
     );
   } else {
     try {
-      await authenticateAndPersist();
+      await withAuthLock(() => authenticateAndPersist());
       console.log("✓ Authentication successful on startup");
     } catch (error) {
       console.error(
         "✗ Authentication failed on startup:",
         errorMessage(error)
       );
-      console.error("Sign in at:", redactSecret(loginPageUrl()));
+      console.error("Sign in at:", redactSecret(signInUrl()));
     }
   }
 
@@ -584,7 +632,6 @@ function activeEmailHint(
     ? parseInt(process.env.ICAL_TLS_PORT, 10)
     : 3443;
   const bind = process.env.ICAL_URL || "127.0.0.1";
-  const tls = loadTlsMaterials(tlsPath);
 
   const servers: (http.Server | https.Server)[] = [];
 
@@ -605,8 +652,10 @@ function activeEmailHint(
       if (route === "login" || route === "login-send-code") {
         if (serveLoginOnHttpPort(req)) {
           handleLoginRoute(route, req, res);
-        } else {
+        } else if (tls) {
           redirectLoginToHttps(req, res);
+        } else {
+          refuseLoginWithoutHttps(res);
         }
         return;
       }
@@ -649,11 +698,6 @@ function activeEmailHint(
         console.log(`Sign in:    https://${host}:${tlsPort}/<ICAL_UNIQUE_URL>/login`);
       });
     servers.push(httpsServer);
-  } else {
-    console.log(
-      "No TLS certificate and no openssl to make one: the HTTPS sign-in port is off. " +
-        "Sign in through a TLS-terminating proxy (set ICAL_PUBLIC_URL), or set ICAL_TLS_CERT and ICAL_TLS_KEY."
-    );
   }
 
   // Run as PID 1 in the container: exit promptly when Docker stops it

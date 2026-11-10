@@ -7,88 +7,23 @@ const HOURS_LINE =
 
 export interface PickupCalendarEvent {
   summary: string;
-  start: WallClockDateTime;
-  end: WallClockDateTime;
-  timezone: typeof TIMEZONE;
+  start: Date;
+  end: Date;
   location: string;
   description: string;
 }
 
-interface WallClockDateParts {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-}
-
-/** Stub recognized by ical-generator as a timezone-neutral wall-clock time. */
-export type WallClockDateTime = WallClockDateParts & {
-  toJSON(): string;
-  toString(): string;
-  toPlainDate(): {
-    year: number;
-    month: number;
-    day: number;
-    toJSON(): string;
-    toString(): string;
-    toPlainDateTime(): WallClockDateTime;
-  };
-  toZonedDateTime(timeZone: string): WallClockZonedDateTime;
-};
-
-type WallClockZonedDateTime = WallClockDateParts & {
-  timeZoneId: string;
-  toJSON(): string;
-  toString(): string;
-  toPlainDateTime(): WallClockDateTime;
-  withTimeZone(timeZone: string): WallClockZonedDateTime;
-};
-
-export function wallClockDateTime(
-  dateStr: string,
-  time12h: string,
-): WallClockDateTime {
-  const { hour, minute } = parseTime12h(time12h);
-  const year = parseInt(dateStr.slice(0, 4), 10);
-  const month = parseInt(dateStr.slice(5, 7), 10);
-  const day = parseInt(dateStr.slice(8, 10), 10);
-  const label = `${dateStr}T${time12h}`;
-
-  const parts: WallClockDateParts = {
-    year,
-    month,
-    day,
-    hour,
-    minute,
-    second: 0,
-  };
-
-  const plainDateTime: WallClockDateTime = {
-    ...parts,
-    toJSON: () => label,
-    toString: () => label,
-    toPlainDate: () => ({
-      year,
-      month,
-      day,
-      toJSON: () => dateStr,
-      toString: () => dateStr,
-      toPlainDateTime: () => plainDateTime,
-    }),
-    toZonedDateTime: (timeZone: string): WallClockZonedDateTime => ({
-      ...parts,
-      timeZoneId: timeZone,
-      toJSON: () => `${label}[${timeZone}]`,
-      toString: () => `${label}[${timeZone}]`,
-      toPlainDateTime: () => plainDateTime,
-      withTimeZone: (nextTimeZone: string) =>
-        plainDateTime.toZonedDateTime(nextTimeZone),
-    }),
-  };
-
-  return plainDateTime;
+/** "3:30pm" in the given timezone, matching the store-hours format. */
+export function formatTime12h(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).formatToParts(date);
+  const get = (type: Intl.DateTimeFormatPartTypes): string =>
+    parts.find((part) => part.type === type)?.value ?? "";
+  return `${get("hour")}:${get("minute")}${get("dayPeriod").toLowerCase()}`;
 }
 
 export function parseStoreHours(
@@ -211,6 +146,11 @@ function addDaysInTimeZone(
   return abandonDateInTimeZone(shifted.toISOString(), timeZone).date;
 }
 
+/**
+ * The last day the store is open before items are abandoned: the abandon day
+ * itself counts only if the store opens before the abandon time, and then the
+ * window ends at whichever comes first, closing or abandonment.
+ */
 export function resolvePickupDay(
   abandonIso: string,
   hoursMap: Map<string, { open: string; close: string }>,
@@ -219,13 +159,32 @@ export function resolvePickupDay(
   date: string;
   weekday: string;
   hours: { open: string; close: string };
+  start: Date;
+  end: Date;
+  /** The window ends at the abandon time, before the store closes. */
+  endsAtAbandon: boolean;
 } | null {
+  const abandonAt = new Date(abandonIso).getTime();
+  if (Number.isNaN(abandonAt)) {
+    return null;
+  }
   let { date, weekday } = abandonDateInTimeZone(abandonIso, tz);
 
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 8; i++) {
     const hours = hoursMap.get(weekday);
     if (hours) {
-      return { date, weekday, hours };
+      const opensAt = zonedLocalToDate(date, hours.open, tz).getTime();
+      const closesAt = zonedLocalToDate(date, hours.close, tz).getTime();
+      if (opensAt < abandonAt) {
+        return {
+          date,
+          weekday,
+          hours,
+          start: new Date(opensAt),
+          end: new Date(Math.min(closesAt, abandonAt)),
+          endsAtAbandon: abandonAt < closesAt,
+        };
+      }
     }
     date = addDaysInTimeZone(date, -1, tz);
     weekday = abandonDateInTimeZone(
@@ -314,7 +273,9 @@ export function buildPickupEvents(
         (item) =>
           `${item.warehouse_location} - ${item.product_name} - ${item.lot_number}`,
       );
-    const hoursLine = `${pickupDay.weekday} ${pickupDay.hours.open} - ${pickupDay.hours.close}`;
+    const hoursLine = pickupDay.endsAtAbandon
+      ? `${pickupDay.weekday} ${pickupDay.hours.open} - ${formatTime12h(pickupDay.end, TIMEZONE)} (items are abandoned then; store closes ${pickupDay.hours.close})`
+      : `${pickupDay.weekday} ${pickupDay.hours.open} - ${pickupDay.hours.close}`;
     const locationsLine =
       locationNames.length > 1
         ? `${locationNames.join(", ")}\n`
@@ -324,9 +285,8 @@ export function buildPickupEvents(
 
     events.push({
       summary: `Mac.Bid Pickup: ${name}`,
-      start: wallClockDateTime(pickupDay.date, pickupDay.hours.open),
-      end: wallClockDateTime(pickupDay.date, pickupDay.hours.close),
-      timezone: TIMEZONE,
+      start: pickupDay.start,
+      end: pickupDay.end,
       location: address,
       description: `${name}\n${locationsLine}${hoursLine}\n\n${warehouseSlots.join("\n")}`,
     });

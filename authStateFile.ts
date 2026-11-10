@@ -27,6 +27,8 @@ export async function saveAuthStateFile(
     encoding: "utf-8",
     mode: 0o600,
   });
+  // mode only applies when the file is created: tighten one that already exists
+  await fs.chmod(path, 0o600);
 }
 
 export async function clearAuthStateFile(path: string): Promise<void> {

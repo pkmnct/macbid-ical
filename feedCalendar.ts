@@ -2,11 +2,14 @@ import ical, { type ICalCalendar } from "ical-generator";
 
 const CALENDAR_TIMEZONE = "America/New_York";
 
+/**
+ * No calendar-wide timezone on purpose: with one set, ical-generator writes
+ * Date values as floating times in the server's own timezone (UTC in the
+ * container), which shifts every event. Without it they are written as UTC
+ * instants, which calendar apps show correctly anywhere.
+ */
 export function createMacbidCalendar(): ICalCalendar {
-  return ical({
-    name: "Mac.Bid Watchlist",
-    timezone: CALENDAR_TIMEZONE,
-  });
+  return ical({ name: "Mac.Bid Watchlist" });
 }
 
 /** All-day event on today so calendar apps surface that sign-in is required. */
