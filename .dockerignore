@@ -3,16 +3,11 @@
 # can never be copied in by `COPY . .`.
 *
 
-# Package manifests and compiler config
+# Package manifests
 !package.json
 !package-lock.json
-!tsconfig.json
 
-# Source and its compiled output (top-level files only)
-!*.ts
-!*.js
-!*.map
-
-# Not needed at runtime
-eslint.config.js
-_app-*.js
+# Runtime files only (compiled output of the top-level .ts sources).
+# Add new modules here by name.
+!index.js
+!authStateFile.js
