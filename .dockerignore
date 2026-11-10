@@ -1,2 +1,18 @@
-node_modules
-npm-debug.log
+# Allowlist: nothing reaches the image unless it is named here, so a .env,
+# saved tokens, TLS keys, the data directory or .git in the working directory
+# can never be copied in by `COPY . .`.
+*
+
+# Package manifests and compiler config
+!package.json
+!package-lock.json
+!tsconfig.json
+
+# Source and its compiled output (top-level files only)
+!*.ts
+!*.js
+!*.map
+
+# Not needed at runtime
+eslint.config.js
+_app-*.js
