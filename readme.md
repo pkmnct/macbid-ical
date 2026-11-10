@@ -39,6 +39,7 @@ MACBID_PASSWORD=your-password
 | `ICAL_TLS_KEY` | No | Path to TLS private key |
 | `ICAL_DATA_DIR` | No | Persistent data directory (default: `./data`) |
 | `ICAL_URL` | No | Bind address (default: `127.0.0.1`) |
+| `ICAL_CACHE_SECONDS` | No | How long a built feed is reused before Mac.Bid is asked again (default: `300`) |
 
 ### 2. First-time login (2FA)
 
@@ -78,30 +79,28 @@ Use your calendar app's "Subscribe to calendar" or "Add from URL" feature with t
 
 ## Docker
 
-Local image (current architecture):
+Local image (current architecture), then the same checks CI runs against it:
 
 ```bash
 npm run docker:build
+scripts/smoke-test.sh
 ```
 
-Publish multi-arch (`linux/amd64`, `linux/arm64`) to Docker Hub:
-
-```bash
-npm run docker
-```
-
-Uses a `docker-container` buildx builder (`macbid-multiarch`); created automatically on first run. Requires `docker login`.
+The published image is built and pushed by GitHub Actions (see [Automation](#automation)); `npm run docker` still pushes a multi-arch build by hand and requires `docker login`.
 
 ```bash
 docker run -d \
   -p 3000:3000 \
-  -p 3443:3443 \
   -v ./macbid-data:/usr/src/macbid-ical/data \
-  -e ICAL_DATA_DIR=/usr/src/macbid-ical/data \
   -e ICAL_URL=0.0.0.0 \
   --env-file .env \
+  --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
   pkmnct/macbid-ical:latest
 ```
+
+The image is distroless (no shell, package manager or `openssl`), runs as a non-root user (uid 65532) and writes only to the data directory. On Linux, make the mounted folder writable by that user (`chown 65532 macbid-data`). Nothing from the build machine's working directory is copied in except the source files: `.dockerignore` is an allowlist.
+
+Because the image has no `openssl`, it cannot generate the self-signed certificate. The HTTPS sign-in port (`3443`) is only opened when a certificate already exists in `data/tls/` or `ICAL_TLS_CERT` / `ICAL_TLS_KEY` point at one. Otherwise sign in through a TLS-terminating proxy with `ICAL_PUBLIC_URL` set.
 
 Persistent files in the data directory:
 
@@ -111,7 +110,7 @@ data/
   tls/           # self-signed cert for the sign-in page
 ```
 
-For production behind nginx, set `ICAL_PUBLIC_URL` and proxy the feed to port `3000` and `/login` to port `3443`. See your compose/nginx setup for details.
+For production behind nginx, set `ICAL_PUBLIC_URL` and proxy everything to port `3000`; the sign-in page is served there when `ICAL_PUBLIC_URL` is set.
 
 In `docker-compose.yml`, always quote URLs — YAML treats `//` as a comment, so an unquoted `https://example.com:8443` becomes `https:/` inside the container:
 
@@ -135,7 +134,7 @@ location / {
 
 Do **not** proxy login to port `3000` without `X-Forwarded-Proto` on older images. Current versions also skip the redirect when `ICAL_PUBLIC_URL` is set (TLS terminated at nginx).
 
-For 2FA in Docker, mount the `data` folder, publish ports `3000` (feed) and `3443` (sign-in, or proxy via nginx), then open `https://<host>:3443/<ICAL_UNIQUE_URL>/login`.
+For 2FA in Docker, mount the `data` folder and open `https://<your public host>/<ICAL_UNIQUE_URL>/login` through the proxy.
 
 Pre-built image: [`pkmnct/macbid-ical`](https://hub.docker.com/r/pkmnct/macbid-ical)
 
@@ -150,11 +149,20 @@ Pre-built image: [`pkmnct/macbid-ical`](https://hub.docker.com/r/pkmnct/macbid-i
 
 ```bash
 npm install
-npm run dev      # run with ts-node
+npm run dev      # compile, then run (reads .env)
+npm run typecheck
 npm run build    # compile to JS
 npm run lint
 npm start        # run compiled output
 ```
+
+## Automation
+
+- **CI** (`.github/workflows/ci.yml`): lint, type-check and build on Node 22, 24 and 26, `npm audit` of production dependencies, and an image build with `scripts/smoke-test.sh` on every pull request and push to `main`.
+- **Publish** (`.github/workflows/publish.yml`): builds, smoke-tests and pushes `pkmnct/macbid-ical:latest` plus a dated tag for amd64 and arm64 on every push to `main`, every Wednesday (so base-image security patches arrive without a code change), and on demand. Needs the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+- **Dependabot** (`.github/dependabot.yml`): weekly grouped updates for npm, the Docker base image and GitHub Actions. Patch and minor npm and Docker updates merge themselves once CI passes; this relies on branch protection requiring the CI checks. Those merges do not start a publish run by themselves, so they ship with the next weekly rebuild.
+
+Mac.Bid's API at `api.macdiscount.com` is the only host the server contacts.
 
 ## License
 

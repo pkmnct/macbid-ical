@@ -1,4 +1,4 @@
-import dotenv from "dotenv";
+import { createHash } from "node:crypto";
 import MacBid, { type AuthInfo, type SerializableAuthState } from "macbid-ts-api";
 import http from "node:http";
 import https from "node:https";
@@ -28,6 +28,7 @@ import {
   loginRedirectUrl,
   parseAppPath,
   readUrlEncodedForm,
+  redactSecret,
   renderLoginPage,
   validationCodeSentMessage,
 } from "./loginPage.js";
@@ -46,7 +47,28 @@ import {
 import { loadTlsMaterials } from "./tls.js";
 import { appVersion } from "./version.js";
 
-dotenv.config();
+// Load a local .env when there is one (development); containers pass real env vars
+try {
+  process.loadEnvFile();
+} catch {
+  // No .env file
+}
+
+const errorMessage = (error: unknown): string =>
+  redactSecret(error instanceof Error ? error.message : String(error));
+
+/** Mac.Bid is unreachable or failing: says nothing about whether we are signed in. */
+const isUnavailable = (error: unknown): boolean => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return (
+    ["MacBidUnavailableError", "FetchError", "TimeoutError", "AbortError"].includes(
+      error.name
+    ) ||
+    (error instanceof TypeError && error.message === "fetch failed")
+  );
+};
 
 function envValidationCode(): string | undefined {
   const code = process.env.MACBID_VALIDATION_CODE?.trim();
@@ -76,6 +98,11 @@ function activeEmailHint(
   if (!feedSecret) {
     throw new Error("You must set ICAL_UNIQUE_URL");
   }
+  if (feedSecret.length < 16) {
+    console.warn(
+      "ICAL_UNIQUE_URL is shorter than 16 characters. It is the only thing protecting the feed and the sign-in page, so use a long random value."
+    );
+  }
 
   const authStateFile = authStatePath();
   const legacyCredentialsFile = legacyCredentialsPath();
@@ -85,6 +112,35 @@ function activeEmailHint(
 
   await ensureDataDir();
   await unlink(legacyCredentialsFile).catch(() => undefined);
+
+  interface FeedResult {
+    /** False when the body is the "sign-in required" placeholder calendar. */
+    signedIn: boolean;
+    body: string;
+  }
+
+  const cacheSeconds = process.env.ICAL_CACHE_SECONDS
+    ? parseInt(process.env.ICAL_CACHE_SECONDS, 10)
+    : 300;
+  let cachedFeed: { body: string; expires: number } | undefined;
+  let pendingFeed: Promise<FeedResult> | undefined;
+
+  // Sign-in attempts are limited for the whole server, not per client: behind
+  // a proxy every request comes from the same address, and there is one user.
+  const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+  const LOGIN_MAX_ATTEMPTS = 10;
+  const loginAttempts: number[] = [];
+  const loginRateLimited = (): boolean => {
+    const now = Date.now();
+    while (loginAttempts.length && loginAttempts[0]! < now - LOGIN_WINDOW_MS) {
+      loginAttempts.shift();
+    }
+    if (loginAttempts.length >= LOGIN_MAX_ATTEMPTS) {
+      return true;
+    }
+    loginAttempts.push(now);
+    return false;
+  };
 
   const pageOptions = (extra?: { message?: string; error?: string }) => ({
     credentialsFromEnv: hasEnvCredentials(),
@@ -183,13 +239,26 @@ function activeEmailHint(
         pendingCredentials.clear();
       }
     } catch (error) {
+      if (isUnavailable(error)) {
+        // Nothing changed on Mac.Bid's side: keep what is saved
+        throw error;
+      }
       await persistFromApi(api.getAuthState(), previous);
       throw error;
     }
   };
 
   const sendHtml = (res: http.ServerResponse, status: number, html: string) => {
-    res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
+    res.writeHead(status, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      // The page URL contains the secret path: never send it on as a referrer
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Content-Security-Policy":
+        "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+    });
     res.end(html);
   };
 
@@ -251,7 +320,7 @@ function activeEmailHint(
         return;
       }
 
-      console.error("Failed to send verification code:", error);
+      console.error("Failed to send verification code:", errorMessage(error));
       sendHtml(
         res,
         500,
@@ -290,6 +359,7 @@ function activeEmailHint(
       }
 
       await authenticateAndPersist({ validation_code: code }, form);
+      cachedFeed = undefined;
       sendHtml(
         res,
         200,
@@ -301,7 +371,7 @@ function activeEmailHint(
         )
       );
     } catch (error) {
-      console.error("Login failed:", error);
+      console.error("Login failed:", errorMessage(error));
       sendHtml(
         res,
         400,
@@ -315,35 +385,27 @@ function activeEmailHint(
     }
   };
 
-  const handleFeed = (res: http.ServerResponse) => {
-    console.log("Valid incoming request, building calendar...");
+  const authRequiredFeed = (reason: unknown): FeedResult => {
+    console.error("Serving sign-in required calendar:", errorMessage(reason));
+    const calendar = createMacbidCalendar();
+    addAuthRequiredEvent(calendar, loginPageUrl());
+    return { signedIn: false, body: calendar.toString() };
+  };
+
+  const buildFeed = async (): Promise<FeedResult> => {
     const renewUrl = loginPageUrl();
+    persistedAuth = await loadPersistedAuth();
 
-    const serveAuthRequiredFeed = (reason: unknown): void => {
-      console.error("Serving sign-in required calendar:", reason);
-      const calendar = createMacbidCalendar();
-      addAuthRequiredEvent(calendar, renewUrl);
-      sendCalendarResponse(res, calendar);
-    };
+    if (
+      !hasActiveSession(persistedAuth) &&
+      !envCredentials() &&
+      !pendingCredentials.get()
+    ) {
+      return authRequiredFeed("No active session and no credentials configured");
+    }
 
-    (async () => {
-      persistedAuth = await loadPersistedAuth();
-
-      if (
-        !hasActiveSession(persistedAuth) &&
-        !envCredentials() &&
-        !pendingCredentials.get()
-      ) {
-        serveAuthRequiredFeed("No active session and no credentials configured");
-        return;
-      }
-
-      try {
-        await authenticateAndPersist();
-      } catch (error) {
-        serveAuthRequiredFeed(error);
-        return;
-      }
+    try {
+      await authenticateAndPersist();
 
       const [favorites, activeItems, locations, buildings] = await Promise.all([
         api.get_watchlist(),
@@ -356,7 +418,9 @@ function activeEmailHint(
 
       const calendar = createMacbidCalendar();
 
+      // Stable ids let calendar apps update an event instead of duplicating it
       calendar.createEvent({
+        id: "macbid-reauthentication",
         start: refresh_token_expiration,
         end: refresh_token_expiration,
         summary: "Mac.Bid Calendar Reauthentication Required",
@@ -369,6 +433,7 @@ function activeEmailHint(
         eventDate.setHours(eventDate.getHours() + 1);
 
         calendar.createEvent({
+          id: `macbid-watchlist-${favorite.auction_lot_id}`,
           start: eventDate,
           end: eventDate,
           summary: favorite.title,
@@ -377,7 +442,13 @@ function activeEmailHint(
       });
 
       for (const event of buildPickupEvents(activeItems, locations, buildings)) {
+        const pickupKey = createHash("sha256")
+          .update(`${event.summary}|${event.location}`)
+          .digest("hex")
+          .slice(0, 16);
+
         calendar.createEvent({
+          id: `macbid-pickup-${pickupKey}`,
           summary: event.summary,
           start: event.start,
           end: event.end,
@@ -387,12 +458,49 @@ function activeEmailHint(
         });
       }
 
-      sendCalendarResponse(res, calendar);
-    })().catch((error) => {
-      if (!res.headersSent) {
-        serveAuthRequiredFeed(error);
+      return { signedIn: true, body: calendar.toString() };
+    } catch (error) {
+      if (isUnavailable(error)) {
+        // An outage is not a sign-out: fail the request so calendar apps keep
+        // what they have, instead of replacing it with a sign-in reminder
+        throw error;
       }
+      return authRequiredFeed(error);
+    }
+  };
+
+  // Each build is a session check plus four Mac.Bid requests. Share one build
+  // between concurrent requests and reuse it for a few minutes, so calendar
+  // apps polling the feed cannot hammer the account.
+  const getFeed = async (): Promise<string> => {
+    if (cachedFeed && cachedFeed.expires > Date.now()) {
+      return cachedFeed.body;
+    }
+    pendingFeed ??= buildFeed().finally(() => {
+      pendingFeed = undefined;
     });
+    const result = await pendingFeed;
+    if (result.signedIn) {
+      cachedFeed = {
+        body: result.body,
+        expires: Date.now() + cacheSeconds * 1000,
+      };
+    }
+    return result.body;
+  };
+
+  const handleFeed = (req: http.IncomingMessage, res: http.ServerResponse) => {
+    console.log("Valid incoming request, building calendar...");
+    getFeed()
+      .then((body) => {
+        sendCalendarResponse(res, body, req.method === "HEAD");
+        return;
+      })
+      .catch((error: unknown) => {
+        console.error("Could not build the feed:", errorMessage(error));
+        res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Could not load data from Mac.Bid\n");
+      });
   };
 
   const proxiedHttps = (req: http.IncomingMessage): boolean => {
@@ -419,6 +527,16 @@ function activeEmailHint(
     req: http.IncomingMessage,
     res: http.ServerResponse
   ): void => {
+    if (req.method === "POST" && loginRateLimited()) {
+      console.warn("Too many sign-in attempts; refusing for now");
+      res.writeHead(429, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Retry-After": String(LOGIN_WINDOW_MS / 1000),
+      });
+      res.end("Too many sign-in attempts. Try again in a few minutes.\n");
+      return;
+    }
+
     if (route === "login") {
       if (req.method === "GET") {
         void handleLoginGet(res);
@@ -442,14 +560,20 @@ function activeEmailHint(
   console.log(`macbid-ical v${appVersion}`);
   console.log("Authenticating on startup...");
   if (!hasActiveSession(persistedAuth) && !envCredentials()) {
-    console.log("No active Mac.Bid session. Sign in at:", loginPageUrl());
+    console.log(
+      "No active Mac.Bid session. Sign in at:",
+      redactSecret(loginPageUrl())
+    );
   } else {
     try {
       await authenticateAndPersist();
       console.log("✓ Authentication successful on startup");
     } catch (error) {
-      console.error("✗ Authentication failed on startup:", error);
-      console.error("Sign in at:", loginPageUrl());
+      console.error(
+        "✗ Authentication failed on startup:",
+        errorMessage(error)
+      );
+      console.error("Sign in at:", redactSecret(loginPageUrl()));
     }
   }
 
@@ -462,12 +586,19 @@ function activeEmailHint(
   const bind = process.env.ICAL_URL || "127.0.0.1";
   const tls = loadTlsMaterials(tlsPath);
 
-  http
+  const servers: (http.Server | https.Server)[] = [];
+
+  const httpServer = http
     .createServer((req, res) => {
       const route = parseAppPath(req.url, feedSecret);
 
       if (route === "feed") {
-        handleFeed(res);
+        if (req.method !== "GET" && req.method !== "HEAD") {
+          res.writeHead(405);
+          res.end();
+          return;
+        }
+        handleFeed(req, res);
         return;
       }
 
@@ -489,29 +620,54 @@ function activeEmailHint(
       res.destroy();
     })
     .listen(httpPort, bind, () => {
-      console.log(`iCal feed:  http://${bind === "0.0.0.0" ? "127.0.0.1" : bind}:${httpPort}/${feedSecret}`);
+      // The secret path is left out on purpose so it does not end up in the logs
+      console.log(`iCal feed:  http://${bind === "0.0.0.0" ? "127.0.0.1" : bind}:${httpPort}/<ICAL_UNIQUE_URL>`);
     });
+  servers.push(httpServer);
 
-  https
-    .createServer({ cert: tls.cert, key: tls.key }, (req, res) => {
-      const route = parseAppPath(req.url, feedSecret);
+  if (tls) {
+    const httpsServer = https
+      .createServer({ cert: tls.cert, key: tls.key }, (req, res) => {
+        const route = parseAppPath(req.url, feedSecret);
 
-      if (route === "login" || route === "login-send-code") {
-        handleLoginRoute(route, req, res);
-        return;
-      }
+        if (route === "login" || route === "login-send-code") {
+          handleLoginRoute(route, req, res);
+          return;
+        }
 
-      if (route !== null) {
-        res.writeHead(405);
+        if (route !== null) {
+          res.writeHead(405);
+          res.end();
+          return;
+        }
+
+        res.writeHead(404);
         res.end();
-        return;
-      }
+      })
+      .listen(tlsPort, bind, () => {
+        const host = bind === "0.0.0.0" ? "127.0.0.1" : bind;
+        console.log(`Sign in:    https://${host}:${tlsPort}/<ICAL_UNIQUE_URL>/login`);
+      });
+    servers.push(httpsServer);
+  } else {
+    console.log(
+      "No TLS certificate and no openssl to make one: the HTTPS sign-in port is off. " +
+        "Sign in through a TLS-terminating proxy (set ICAL_PUBLIC_URL), or set ICAL_TLS_CERT and ICAL_TLS_KEY."
+    );
+  }
 
-      res.writeHead(404);
-      res.end();
-    })
-    .listen(tlsPort, bind, () => {
-      const host = bind === "0.0.0.0" ? "127.0.0.1" : bind;
-      console.log(`Sign in:    https://${host}:${tlsPort}/${feedSecret}/login`);
+  // Run as PID 1 in the container: exit promptly when Docker stops it
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      let open = servers.length;
+      for (const server of servers) {
+        server.close(() => {
+          if (--open === 0) {
+            process.exit(0);
+          }
+        });
+        server.closeAllConnections();
+      }
     });
+  }
 })();

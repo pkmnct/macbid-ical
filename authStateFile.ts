@@ -22,7 +22,11 @@ export async function saveAuthStateFile(
   path: string,
   state: PersistedAuthState
 ): Promise<void> {
-  await fs.writeFile(path, JSON.stringify(state, null, 2), "utf-8");
+  // Session tokens: readable by the owner only
+  await fs.writeFile(path, JSON.stringify(state, null, 2), {
+    encoding: "utf-8",
+    mode: 0o600,
+  });
 }
 
 export async function clearAuthStateFile(path: string): Promise<void> {

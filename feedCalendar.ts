@@ -22,6 +22,8 @@ export function addAuthRequiredEvent(
   calendar.createEvent({
     start,
     end,
+    // A stable id lets calendar apps update an event instead of duplicating it
+    id: "macbid-sign-in-required",
     allDay: true,
     timezone: CALENDAR_TIMEZONE,
     summary: "Mac.Bid Sign-In Required",
@@ -32,10 +34,13 @@ export function addAuthRequiredEvent(
 
 export function sendCalendarResponse(
   res: import("node:http").ServerResponse,
-  calendar: ICalCalendar
+  body: string,
+  headOnly = false
 ): void {
   res.writeHead(200, {
     "Content-Type": "text/calendar; charset=utf-8",
+    "Cache-Control": "private, no-store",
+    "X-Content-Type-Options": "nosniff",
   });
-  res.end(calendar.toString());
+  res.end(headOnly ? undefined : body);
 }

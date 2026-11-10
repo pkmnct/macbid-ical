@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { PersistedAuthState } from "./authStateFile.js";
 import { appVersion } from "./version.js";
 import {
@@ -19,17 +20,34 @@ export function parseAppPath(
   const pathname = requestUrl.split("?")[0]?.split("#")[0] ?? "";
   const base = `/${feedSecret}`;
 
-  if (pathname === base) {
+  // Always make all three comparisons so timing does not depend on the match
+  const feed = constantTimeEqual(pathname, base);
+  const login = constantTimeEqual(pathname, `${base}/login`);
+  const sendCode = constantTimeEqual(pathname, `${base}/login/send-code`);
+
+  if (feed) {
     return "feed";
   }
-  if (pathname === `${base}/login`) {
+  if (login) {
     return "login";
   }
-  if (pathname === `${base}/login/send-code`) {
+  if (sendCode) {
     return "login-send-code";
   }
 
   return null;
+}
+
+/** Compares fixed-length digests, so timing reveals nothing about the secret. */
+function constantTimeEqual(a: string, b: string): boolean {
+  const digest = (value: string) => createHash("sha256").update(value).digest();
+  return timingSafeEqual(digest(a), digest(b));
+}
+
+/** Replaces the secret path in a URL or message before it is logged. */
+export function redactSecret(text: string): string {
+  const secret = process.env.ICAL_UNIQUE_URL;
+  return secret ? text.replaceAll(secret, "<ICAL_UNIQUE_URL>") : text;
 }
 
 function bindHost(): string {
@@ -334,11 +352,19 @@ function sendCodeForm(model: LoginPageModel, label: string): string {
 </form>`;
 }
 
+/** The sign-in form is an email, a password and a code: far below this. */
+const MAX_FORM_BYTES = 16 * 1024;
+
 export async function readUrlEncodedForm(
   req: import("node:http").IncomingMessage
 ): Promise<URLSearchParams> {
   const chunks: Buffer[] = [];
+  let size = 0;
   for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_FORM_BYTES) {
+      throw new Error("Form is too large.");
+    }
     chunks.push(chunk as Buffer);
   }
   return new URLSearchParams(Buffer.concat(chunks).toString("utf8"));

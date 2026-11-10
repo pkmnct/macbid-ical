@@ -1,27 +1,9 @@
-node_modules
-npm-debug.log
+# Allowlist: nothing reaches the build unless it is named here, so a .env,
+# saved tokens, TLS keys, the data directory or .git in the working directory
+# can never end up in the image.
+*
 
-# Local secrets and runtime data
-.env
-.env.*
-data/
-.macbid-tokens.json
-.macbid-credentials.json
-.macbid-tls/
-
-# Git / CI
-.git
-.github
-
-# Dev caches and coverage
-.eslintcache
-*.tsbuildinfo
-coverage
-.nyc_output
-
-# OS
-.DS_Store
-
-# Local artifacts
-_app-*.js
-requestGuard.*
+!package.json
+!package-lock.json
+!tsconfig.json
+!*.ts
