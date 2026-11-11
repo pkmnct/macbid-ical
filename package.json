@@ -15,7 +15,7 @@
     },
     "dependencies": {
         "ical-generator": "^11.0.0",
-        "macbid-ts-api": "^1.1.0"
+        "macbid-ts-api": "^2.0.0"
     },
     "devDependencies": {
         "@eslint/js": "^10.0.1",
