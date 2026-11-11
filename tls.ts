@@ -4,6 +4,8 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -18,6 +20,11 @@ export interface TlsMaterials {
  * openssl command if none exists. Returns null when there is no certificate
  * and openssl is not available (as in the published Docker image).
  */
+/** A file that exists and is not empty (an empty key is no key). */
+function hasContent(path: string): boolean {
+  return existsSync(path) && statSync(path).size > 0;
+}
+
 export function loadTlsMaterials(dir: string): TlsMaterials | null {
   const configuredCert = process.env.ICAL_TLS_CERT?.trim();
   const configuredKey = process.env.ICAL_TLS_KEY?.trim();
@@ -32,7 +39,7 @@ export function loadTlsMaterials(dir: string): TlsMaterials | null {
         `ICAL_TLS_CERT and ICAL_TLS_KEY must both point to existing files (cert: ${certPath}, key: ${keyPath})`
       );
     }
-  } else if (!existsSync(certPath) || !existsSync(keyPath)) {
+  } else if (!hasContent(certPath) || !hasContent(keyPath)) {
     try {
       // The private key is written here: keep the folder and the key private
       mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -54,6 +61,11 @@ export function loadTlsMaterials(dir: string): TlsMaterials | null {
       chmodSync(keyPath, 0o600);
       console.log(`Generated self-signed TLS certificate at ${certPath}`);
     } catch {
+      // Do not leave the empty private key file behind: a later start (or an
+      // operator who adds only a certificate) would take it for a real key
+      if (existsSync(keyPath) && statSync(keyPath).size === 0) {
+        unlinkSync(keyPath);
+      }
       return null;
     }
   }
