@@ -19,8 +19,13 @@ export function tlsDir(): string {
 }
 
 export async function ensureDataDir(): Promise<void> {
-  await mkdir(dataDir(), { recursive: true });
-  await mkdir(tlsDir(), { recursive: true });
+  // Tokens and the TLS key live here: private to the owner when created
+  await mkdir(dataDir(), { recursive: true, mode: 0o700 });
+  await mkdir(tlsDir(), { recursive: true, mode: 0o700 });
+  // mkdir leaves an existing folder alone: tighten an older install's TLS
+  // folder (it holds the private key). A mounted folder owned by someone else
+  // cannot be changed, and is then the operator's to set up.
+  await chmod(tlsDir(), 0o700).catch(() => undefined);
 }
 
 const exists = (path: string): Promise<boolean> =>

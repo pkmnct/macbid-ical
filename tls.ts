@@ -1,5 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 export interface TlsMaterials {
@@ -30,6 +36,10 @@ export function loadTlsMaterials(dir: string): TlsMaterials | null {
     try {
       // The private key is written here: keep the folder and the key private
       mkdirSync(dir, { recursive: true, mode: 0o700 });
+      // Create the key file empty and private first: openssl then fills it in
+      // place, so it is never readable by others, whatever the umask is
+      writeFileSync(keyPath, "", { mode: 0o600 });
+      chmodSync(keyPath, 0o600);
       execFileSync(
         "openssl",
         [
