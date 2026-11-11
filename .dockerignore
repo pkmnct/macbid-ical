@@ -6,4 +6,7 @@
 !package.json
 !package-lock.json
 !tsconfig.json
+# The multi-stage Dockerfile compiles these in the build stage; only the
+# compiled output reaches the runtime image. Add new modules as .ts files and
+# nothing else needs to be listed.
 !*.ts
