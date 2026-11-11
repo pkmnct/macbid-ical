@@ -95,8 +95,23 @@ export function feedPublicBaseUrl(): string {
   }
 
   const host = bindHost();
-  const port = process.env.ICAL_PORT ? parseInt(process.env.ICAL_PORT, 10) : 3000;
+  const port = portFromEnv("ICAL_PORT", 3000);
   return `http://${host}:${port}`;
+}
+
+/** A port from the environment: a whole number from 1 to 65535, or the default. */
+export function portFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error(
+      `${name} must be a port number from 1 to 65535 (got ${JSON.stringify(raw)})`
+    );
+  }
+  return value;
 }
 
 export function loginPublicBaseUrl(): string {
@@ -106,9 +121,7 @@ export function loginPublicBaseUrl(): string {
   }
 
   const host = bindHost();
-  const port = process.env.ICAL_TLS_PORT
-    ? parseInt(process.env.ICAL_TLS_PORT, 10)
-    : 3443;
+  const port = portFromEnv("ICAL_TLS_PORT", 3443);
   return `https://${host}:${port}`;
 }
 

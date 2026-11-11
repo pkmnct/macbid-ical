@@ -33,6 +33,7 @@ import {
   loginPageUrl,
   loginRedirectUrl,
   parseAppPath,
+  portFromEnv,
   readUrlEncodedForm,
   redactSecret,
   renderLoginPage,
@@ -180,6 +181,12 @@ function activeEmailHint(
       reset: () => {
         attempts.length = 0;
       },
+      // Seconds until the oldest attempt leaves the window and one slot frees
+      retryAfterSeconds: (): number =>
+        Math.max(
+          1,
+          Math.ceil(((attempts[0] ?? Date.now()) + LOGIN_WINDOW_MS - Date.now()) / 1000)
+        ),
     };
   };
   const codeLimiter = makeLimiter(10);
@@ -282,7 +289,19 @@ function activeEmailHint(
         // Nothing changed on Mac.Bid's side: keep what is saved
         throw error;
       }
-      await persistFromApi(api.getAuthState(), previous);
+      if (
+        hasPersistedTokens(previous) &&
+        !hasPersistedTokens(api.getAuthState())
+      ) {
+        // The library dropped the session (its refresh was refused): the
+        // saved copy is dead too. Forget it, or the sign-in page would keep
+        // reporting it as active and refuse to send a new code.
+        await clearAuthStateFile(authStateFile);
+        persistedAuth = null;
+        await persistFromApi(api.getAuthState(), null);
+      } else {
+        await persistFromApi(api.getAuthState(), previous);
+      }
       throw error;
     }
   };
@@ -507,8 +526,16 @@ function activeEmailHint(
     });
 
     data.favorites.forEach((favorite) => {
-      const eventDate = new Date(favorite.expected_close_date);
-      eventDate.setHours(eventDate.getHours() + 1);
+      // new Date(null) is the epoch, not an invalid date: check for a value too
+      const closes = new Date(favorite.expected_close_date);
+      if (!favorite.expected_close_date || Number.isNaN(closes.getTime())) {
+        // One odd item must not take the whole feed down
+        console.warn(
+          `Skipping watchlist item ${favorite.auction_lot_id}: invalid close date`
+        );
+        return;
+      }
+      const eventDate = new Date(closes.getTime() + 60 * 60 * 1000);
 
       calendar.createEvent({
         id: `macbid-watchlist-${favorite.auction_lot_id}`,
@@ -553,10 +580,16 @@ function activeEmailHint(
       pendingFeed = undefined;
     });
     const result = await pendingFeed;
-    if (result.signedIn) {
+    // The sign-in placeholder is kept for a shorter time: long enough that
+    // polling cannot hammer a login (each one can text a code), short enough
+    // that a fresh sign-in shows up quickly. Signing in clears it at once.
+    const ttlSeconds = result.signedIn
+      ? cacheSeconds
+      : Math.min(cacheSeconds, 60);
+    if (ttlSeconds > 0) {
       cachedFeed = {
         body: result.body,
-        expires: Date.now() + cacheSeconds * 1000,
+        expires: Date.now() + ttlSeconds * 1000,
       };
     }
     return result.body;
@@ -616,9 +649,11 @@ function activeEmailHint(
       console.warn("Too many sign-in attempts; refusing for now");
       res.writeHead(429, {
         "Content-Type": "text/plain; charset=utf-8",
-        "Retry-After": String(LOGIN_WINDOW_MS / 1000),
+        "Retry-After": String(limiter.retryAfterSeconds()),
       });
-      res.end("Too many sign-in attempts. Try again in a few minutes.\n");
+      res.end(
+        `Too many sign-in attempts. Try again in ${Math.ceil(limiter.retryAfterSeconds() / 60)} minute(s).\n`
+      );
       return;
     }
     if (req.method === "POST") {
@@ -652,31 +687,8 @@ function activeEmailHint(
         "Sign in through a TLS-terminating proxy (set ICAL_PUBLIC_URL), or set ICAL_TLS_CERT and ICAL_TLS_KEY."
     );
   }
-  console.log("Authenticating on startup...");
-  if (!hasActiveSession(persistedAuth) && !envCredentials()) {
-    console.log(
-      "No active Mac.Bid session. Sign in at:",
-      redactSecret(signInUrl())
-    );
-  } else {
-    try {
-      await withAuthLock(() => authenticateAndPersist());
-      console.log("✓ Authentication successful on startup");
-    } catch (error) {
-      console.error(
-        "✗ Authentication failed on startup:",
-        errorMessage(error)
-      );
-      console.error("Sign in at:", redactSecret(signInUrl()));
-    }
-  }
-
-  const httpPort = process.env.ICAL_PORT
-    ? parseInt(process.env.ICAL_PORT, 10)
-    : 3000;
-  const tlsPort = process.env.ICAL_TLS_PORT
-    ? parseInt(process.env.ICAL_TLS_PORT, 10)
-    : 3443;
+  const httpPort = portFromEnv("ICAL_PORT", 3000);
+  const tlsPort = portFromEnv("ICAL_TLS_PORT", 3443);
   const bind = process.env.ICAL_URL || "127.0.0.1";
 
   const servers: (http.Server | https.Server)[] = [];
@@ -752,6 +764,31 @@ function activeEmailHint(
       });
     servers.push(httpsServer);
   }
+
+  // Runs after the servers are listening, so a slow Mac.Bid never keeps the
+  // port closed (health checks and calendar polls get an answer meanwhile)
+  const authenticateOnStartup = async (): Promise<void> => {
+    console.log("Authenticating on startup...");
+    if (!hasActiveSession(persistedAuth) && !envCredentials()) {
+      console.log(
+        "No active Mac.Bid session. Sign in at:",
+        redactSecret(signInUrl())
+      );
+    } else {
+      try {
+        await withAuthLock(() => authenticateAndPersist());
+        console.log("✓ Authentication successful on startup");
+      } catch (error) {
+        console.error(
+          "✗ Authentication failed on startup:",
+          errorMessage(error)
+        );
+        console.error("Sign in at:", redactSecret(signInUrl()));
+      }
+    }
+  };
+
+  void authenticateOnStartup();
 
   // Run as PID 1 in the container: exit promptly when Docker stops it
   for (const signal of ["SIGINT", "SIGTERM"] as const) {

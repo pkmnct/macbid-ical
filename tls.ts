@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface TlsMaterials {
@@ -28,7 +28,8 @@ export function loadTlsMaterials(dir: string): TlsMaterials | null {
     }
   } else if (!existsSync(certPath) || !existsSync(keyPath)) {
     try {
-      mkdirSync(dir, { recursive: true });
+      // The private key is written here: keep the folder and the key private
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
       execFileSync(
         "openssl",
         [
@@ -40,6 +41,7 @@ export function loadTlsMaterials(dir: string): TlsMaterials | null {
         ],
         { stdio: "ignore" }
       );
+      chmodSync(keyPath, 0o600);
       console.log(`Generated self-signed TLS certificate at ${certPath}`);
     } catch {
       return null;

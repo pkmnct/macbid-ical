@@ -32,8 +32,9 @@ export function maskEmail(email: string): string {
   if (!domain) {
     return email;
   }
-  const masked =
-    local.length <= 2 ? `${local[0] ?? ""}•••` : `${local.slice(0, 2)}•••`;
+  // Never show more than half of the local part
+  const shown = local.slice(0, Math.min(2, Math.floor(local.length / 2)));
+  const masked = `${shown}•••`;
   return `${masked}@${domain}`;
 }
 
