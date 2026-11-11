@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -15,16 +16,25 @@ export interface TlsMaterials {
   key: Buffer;
 }
 
-/**
- * Loads the sign-in page's certificate, generating a self-signed one with the
- * openssl command if none exists. Returns null when there is no certificate
- * and openssl is not available (as in the published Docker image).
- */
 /** A file that exists and is not empty (an empty key is no key). */
 function hasContent(path: string): boolean {
   return existsSync(path) && statSync(path).size > 0;
 }
 
+/** Best effort: a leftover temporary file must never stop the server starting. */
+function removeQuietly(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Already gone, or not ours to delete
+  }
+}
+
+/**
+ * Loads the sign-in page's certificate, generating a self-signed one with the
+ * openssl command if none exists. Returns null when there is no certificate
+ * and openssl is not available (as in the published Docker image).
+ */
 export function loadTlsMaterials(dir: string): TlsMaterials | null {
   const configuredCert = process.env.ICAL_TLS_CERT?.trim();
   const configuredKey = process.env.ICAL_TLS_KEY?.trim();
@@ -39,34 +49,51 @@ export function loadTlsMaterials(dir: string): TlsMaterials | null {
         `ICAL_TLS_CERT and ICAL_TLS_KEY must both point to existing files (cert: ${certPath}, key: ${keyPath})`
       );
     }
-  } else if (!hasContent(certPath) || !hasContent(keyPath)) {
-    try {
-      // The private key is written here: keep the folder and the key private
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-      // Create the key file empty and private first: openssl then fills it in
-      // place, so it is never readable by others, whatever the umask is
-      writeFileSync(keyPath, "", { mode: 0o600 });
-      chmodSync(keyPath, 0o600);
-      execFileSync(
-        "openssl",
-        [
-          "req", "-x509", "-newkey", "rsa:2048",
-          "-keyout", keyPath,
-          "-out", certPath,
-          "-days", "825", "-nodes",
-          "-subj", "/CN=macbid-ical",
-        ],
-        { stdio: "ignore" }
+  } else {
+    const haveCert = hasContent(certPath);
+    const haveKey = hasContent(keyPath);
+
+    // Half a pair is somebody's certificate or key: never overwrite it
+    if (haveCert !== haveKey) {
+      // Not fatal: the feed still works, and sign-in can go through a proxy
+      console.error(
+        `${haveCert ? "cert.pem" : "key.pem"} exists in ${dir} without ${haveCert ? "key.pem" : "cert.pem"}; HTTPS sign-in is off until both files are there (add the missing one or remove the other)`
       );
-      chmodSync(keyPath, 0o600);
-      console.log(`Generated self-signed TLS certificate at ${certPath}`);
-    } catch {
-      // Do not leave the empty private key file behind: a later start (or an
-      // operator who adds only a certificate) would take it for a real key
-      if (existsSync(keyPath) && statSync(keyPath).size === 0) {
-        unlinkSync(keyPath);
-      }
       return null;
+    }
+
+    if (!haveCert) {
+      // Generate next to the final files and rename on success, so a failure
+      // never touches what is already there
+      const tempKey = `${keyPath}.tmp`;
+      const tempCert = `${certPath}.tmp`;
+      try {
+        // The private key is written here: keep the folder and the key private
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        // Create the key file empty and private first: openssl then fills it in
+        // place, so it is never readable by others, whatever the umask is
+        writeFileSync(tempKey, "", { mode: 0o600 });
+        chmodSync(tempKey, 0o600);
+        execFileSync(
+          "openssl",
+          [
+            "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", tempKey,
+            "-out", tempCert,
+            "-days", "825", "-nodes",
+            "-subj", "/CN=macbid-ical",
+          ],
+          { stdio: "ignore" }
+        );
+        chmodSync(tempKey, 0o600);
+        renameSync(tempKey, keyPath);
+        renameSync(tempCert, certPath);
+        console.log(`Generated self-signed TLS certificate at ${certPath}`);
+      } catch {
+        removeQuietly(tempKey);
+        removeQuietly(tempCert);
+        return null;
+      }
     }
   }
 
