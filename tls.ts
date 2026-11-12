@@ -67,6 +67,7 @@ export function loadTlsMaterials(dir: string): TlsMaterials | null {
       // never touches what is already there
       const tempKey = `${keyPath}.tmp`;
       const tempCert = `${certPath}.tmp`;
+      let certPlaced = false;
       try {
         // The private key is written here: keep the folder and the key private
         mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -86,12 +87,20 @@ export function loadTlsMaterials(dir: string): TlsMaterials | null {
           { stdio: "ignore" }
         );
         chmodSync(tempKey, 0o600);
-        renameSync(tempKey, keyPath);
+        // Key last: it is the file whose presence says generation finished,
+        // and a failure in between must not leave half a pair behind
         renameSync(tempCert, certPath);
+        certPlaced = true;
+        renameSync(tempKey, keyPath);
         console.log(`Generated self-signed TLS certificate at ${certPath}`);
       } catch {
         removeQuietly(tempKey);
         removeQuietly(tempCert);
+        if (certPlaced) {
+          // The key rename failed after the certificate was moved: take it
+          // back, or the next start sees half a pair and refuses to generate
+          removeQuietly(certPath);
+        }
         return null;
       }
     }
