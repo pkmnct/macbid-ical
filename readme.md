@@ -74,6 +74,8 @@ docker run -d \
   pkmnct/macbid-ical:latest
 ```
 
+Add `-p 3443:3443` if you supply a certificate (below), so the HTTPS sign-in page is reachable. Behind a TLS-terminating proxy, port `3000` is enough.
+
 The image runs as a non-root user (uid 65532). On Linux, make the mounted folder writable by it: `chown 65532 macbid-data`.
 
 The image has no `openssl`, so it cannot generate a certificate. Sign-in needs HTTPS, so provide it one of two ways:
