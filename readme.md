@@ -1,17 +1,19 @@
 # macbid-ical
 
-Serve an iCal feed of your [Mac.Bid](https://www.mac.bid) watchlist and pickup deadlines for Apple Calendar, Google Calendar, or any app that subscribes to `.ics` URLs.
+Serve an iCal feed of your [Mac.Bid](https://www.mac.bid) watchlist and pickup windows for Apple Calendar, Google Calendar, or any app that subscribes to `.ics` URLs.
 
-Each watchlist item becomes a calendar event at its expected close time, with a link to the lot. Won items awaiting pickup are grouped into one event per building (same address), scheduled on the earliest abandon date using that location's open hours, with warehouse slot codes listed in the description. A reminder event is added for when your API session expires.
+- Each watchlist item becomes an event at its expected close time, with a link to the lot.
+- Won items awaiting pickup become one event per pickup window and building, ending at the store's closing time or the abandon time, whichever comes first. The description lists the warehouse slot codes.
+- A reminder event is added for when your Mac.Bid session expires.
 
 ## Requirements
 
-- Node.js **22** or **>= 24**
+- Node.js **22** or **>= 24** (or Docker)
 - A Mac.Bid account
 
 ## Setup
 
-### 1. Configure environment
+### 1. Configure
 
 Create a `.env` file:
 
@@ -19,74 +21,48 @@ Create a `.env` file:
 ICAL_UNIQUE_URL=pick-a-long-random-secret-path
 ```
 
-Credentials can be set in `.env` **or** entered on the HTTPS sign-in page (see below).
-
-```env
-MACBID_EMAIL=you@example.com
-MACBID_PASSWORD=your-password
-```
+Your Mac.Bid email and password can go in `.env` too (`MACBID_EMAIL`, `MACBID_PASSWORD`), or you can type them on the sign-in page.
 
 | Variable | Required | Description |
 |---|---|---|
-| `ICAL_UNIQUE_URL` | Yes | Secret URL path for the feed (acts as a password) |
-| `MACBID_EMAIL` | No* | Mac.Bid account email (*or use sign-in page) |
-| `MACBID_PASSWORD` | No* | Mac.Bid account password (*or use sign-in page) |
-| `ICAL_PUBLIC_URL` | No | Public HTTPS base URL for sign-in links in calendar events |
-| `MACBID_VALIDATION_CODE` | No | SMS 2FA code (optional; prefer the web sign-in page) |
-| `ICAL_PORT` | No | HTTP port for the iCal feed (default: `3000`) |
-| `ICAL_TLS_PORT` | No | HTTPS port for sign-in (default: `3443`) |
-| `ICAL_TLS_CERT` | No | Path to TLS certificate (default: auto-generated self-signed in `data/tls/`) |
-| `ICAL_TLS_KEY` | No | Path to TLS private key |
-| `ICAL_DATA_DIR` | No | Persistent data directory (default: `./data`) |
-| `ICAL_URL` | No | Bind address (default: `127.0.0.1`) |
-| `ICAL_CACHE_SECONDS` | No | How long a built feed is reused before Mac.Bid is asked again (default: `300`) |
+| `ICAL_UNIQUE_URL` | Yes | Secret URL path for the feed. It is the only protection on the feed, so make it long and random |
+| `MACBID_EMAIL` / `MACBID_PASSWORD` | No | Mac.Bid credentials (or enter them on the sign-in page) |
+| `ICAL_PUBLIC_URL` | No | Public HTTPS URL, for sign-in behind a proxy and for the links in calendar events |
+| `MACBID_VALIDATION_CODE` | No | SMS code for headless setups (the sign-in page is easier) |
+| `ICAL_PORT` | No | HTTP port for the feed (default `3000`) |
+| `ICAL_TLS_PORT` | No | HTTPS port for sign-in (default `3443`) |
+| `ICAL_TLS_CERT` / `ICAL_TLS_KEY` | No | Your own certificate and key. Both must exist. Default: a self-signed pair generated in `data/tls/` |
+| `ICAL_DATA_DIR` | No | Where tokens and certificates are kept (default `./data`) |
+| `ICAL_URL` | No | Bind address (default `127.0.0.1`) |
+| `ICAL_CACHE_SECONDS` | No | How long a built feed is reused (default `300`) |
 
-### 2. First-time login (2FA)
+### 2. Sign in (2FA)
 
-Mac.Bid requires SMS verification on first login. Open the **HTTPS** sign-in page in your browser (accept the self-signed certificate warning on first visit):
+Mac.Bid sends an SMS code on first login. Open the sign-in page over HTTPS (accept the self-signed certificate warning):
 
 ```
 https://127.0.0.1:3443/<ICAL_UNIQUE_URL>/login
 ```
 
-1. Enter your Mac.Bid email and password (skipped if `MACBID_EMAIL` / `MACBID_PASSWORD` are set in `.env`).
-2. Click **Send verification code** and check your phone for the SMS.
-3. Enter the code and click **Sign in**.
+1. Enter your email and password (skipped if they are in `.env`).
+2. Click **Send verification code**.
+3. Enter the code from your phone and click **Sign in**.
 
-Credentials submitted on the sign-in page are kept **in memory only** during the SMS step (about 15 minutes), then discarded. Only API tokens are written to `data/tokens.json`. Email and password are never saved to disk unless you set them in `.env` / Docker secrets.
+Passwords typed on the page are held in memory for the SMS step (about 15 minutes) and never written to disk. Only session tokens are saved, in `data/tokens.json`. If a session is lost or expires, come back to the same page for a new code.
 
-The iCal feed stays on plain HTTP (`ICAL_PORT`, default 3000) so calendar apps are not blocked by the self-signed certificate. Only the sign-in page uses HTTPS.
+Sign-in only works over HTTPS. Without a certificate and without `ICAL_PUBLIC_URL`, the page answers `503` with setup instructions.
 
-If the server runs behind Docker or a reverse proxy, set `ICAL_PUBLIC_URL` to your public HTTPS origin (e.g. `https://macbid-ical.example.com`). That URL is included in the calendar re-authentication reminder event.
+### 3. Subscribe
 
-**Alternative:** set `MACBID_VALIDATION_CODE` in `.env` and restart (useful for fully headless setups). The saved `device_id` is reused on the next attempt, so a second SMS is not sent unless you request a new code from the sign-in page.
-
-To request a fresh code from scratch, use **Send new verification code** on the sign-in page, or delete `data/tokens.json` and start over.
-
-> Building something with a UI? You can pass the code in the same session via `validation_code` — see [`macbid-ts-api` README](https://github.com/pkmnct/macbid-ts-api#two-factor-authentication).
-
-### 3. Subscribe in your calendar
-
-Once running:
+Add this address with your calendar app's "Subscribe to calendar" or "Add from URL":
 
 ```
 http://127.0.0.1:3000/<ICAL_UNIQUE_URL>
 ```
 
-Use your calendar app's "Subscribe to calendar" or "Add from URL" feature with that address.
-
-> **Security:** `ICAL_UNIQUE_URL` is the only protection on your feed. Use a long random value and do not share the URL.
+The feed stays on plain HTTP so calendar apps are not blocked by the self-signed certificate.
 
 ## Docker
-
-Local image (current architecture), then the same checks CI runs against it:
-
-```bash
-npm run docker:build
-scripts/smoke-test.sh
-```
-
-The published image is built and pushed by GitHub Actions (see [Automation](#automation)); `npm run docker` still pushes a multi-arch build by hand and requires `docker login`.
 
 ```bash
 docker run -d \
@@ -98,71 +74,18 @@ docker run -d \
   pkmnct/macbid-ical:latest
 ```
 
-The image is distroless (no shell, package manager or `openssl`), runs as a non-root user (uid 65532) and writes only to the data directory. On Linux, make the mounted folder writable by that user (`chown 65532 macbid-data`). Nothing from the build machine's working directory is copied in except the source files: `.dockerignore` is an allowlist.
+The image runs as a non-root user (uid 65532). On Linux, make the mounted folder writable by it: `chown 65532 macbid-data`.
 
-Because the image has no `openssl`, it cannot generate the self-signed certificate. The HTTPS sign-in port (`3443`) is only opened when a certificate already exists in `data/tls/` or `ICAL_TLS_CERT` / `ICAL_TLS_KEY` point at one. Otherwise sign in through a TLS-terminating proxy with `ICAL_PUBLIC_URL` set. With neither, sign-in is turned off: the sign-in URL answers `503` with these instructions rather than redirecting to a port that is not listening.
+The image has no `openssl`, so it cannot generate a certificate. Sign-in needs HTTPS, so provide it one of two ways:
 
-Persistent files in the data directory:
-
-```
-data/
-  tokens.json    # Mac.Bid session tokens
-  tls/           # self-signed cert for the sign-in page
-```
-
-For production behind nginx, set `ICAL_PUBLIC_URL` and proxy everything to port `3000`; the sign-in page is served there only when `ICAL_PUBLIC_URL` is set **and** the proxy sends `X-Forwarded-Proto: https`. Requests that reach port `3000` directly are redirected to the HTTPS port instead, so the form is never served in cleartext.
-
-In `docker-compose.yml`, always quote URLs — YAML treats `//` as a comment, so an unquoted `https://example.com:8443` becomes `https:/` inside the container:
-
-```yaml
-environment:
-  ICAL_PUBLIC_URL: "https://example.com:8443"
-```
-
-If compose builds the URL from `${DOMAIN}`, set `DOMAIN` in the same `.env` file compose reads (the `DOMAIN variable is not set` warning means it is empty).
-
-Example nginx config (terminates TLS, proxies everything to the HTTP feed port; login works via `X-Forwarded-Proto`):
-
-```nginx
-location / {
-    proxy_pass http://macbid-ical:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-}
-```
-
-Always set `X-Forwarded-Proto` when proxying: without it the sign-in page is not served on port `3000`.
-
-For 2FA in Docker, mount the `data` folder and open `https://<your public host>/<ICAL_UNIQUE_URL>/login` through the proxy.
+- Supply a certificate: put `cert.pem` and `key.pem` in `data/tls/`, or set `ICAL_TLS_CERT` and `ICAL_TLS_KEY`. This opens the HTTPS port `3443`.
+- Terminate TLS yourself in front of the container: set `ICAL_PUBLIC_URL` to the public HTTPS address and make sure your TLS-terminating proxy or load balancer sends `X-Forwarded-Proto: https`. Without that header the sign-in page answers `400` on port `3000`. Only trusted infrastructure should be able to reach port `3000`, since any client that can reach it directly can send that header.
 
 Pre-built image: [`pkmnct/macbid-ical`](https://hub.docker.com/r/pkmnct/macbid-ical)
 
-## How it works
+## Contributing
 
-- Uses [`macbid-ts-api`](https://github.com/pkmnct/macbid-ts-api) for authentication, watchlist, active won items, and location data.
-- Auth state is persisted in `data/tokens.json` from the state returned by `authenticate()` and `getAuthState()`.
-- Pickup events are built in `pickupEvents.ts`: one event per building (same address) on the earliest abandon date, with that day's store hours and all warehouse slot codes for items at that building.
-- The calendar includes a re-authentication reminder on refresh token expiry.
-
-## Development
-
-```bash
-npm install
-npm run dev      # compile, then run (reads .env)
-npm run typecheck
-npm run build    # compile to JS
-npm run lint
-npm start        # run compiled output
-```
-
-## Automation
-
-- **CI** (`.github/workflows/ci.yml`): lint, type-check and build on Node 22, 24 and 26, `npm audit` of production dependencies, and an image build with `scripts/smoke-test.sh` on every pull request and push to `main`.
-- **Publish** (`.github/workflows/publish.yml`): builds, smoke-tests and pushes `pkmnct/macbid-ical:latest` plus a dated tag for amd64 and arm64 on every push to `main`, every Wednesday (so base-image security patches arrive without a code change), and on demand. Needs the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
-- **Dependabot** (`.github/dependabot.yml`): weekly grouped updates for npm, the Docker base image and GitHub Actions. Patch and minor npm and Docker updates merge themselves once CI passes; this relies on branch protection requiring the CI checks. Those merges do not start a publish run by themselves, so they ship with the next weekly rebuild.
-
-Mac.Bid's API at `api.macdiscount.com` is the only host the server contacts.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development, how it works, and the CI and publish workflows.
 
 ## License
 
