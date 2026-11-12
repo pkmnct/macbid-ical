@@ -9,11 +9,24 @@ export interface PersistedAuthState extends SerializableAuthState {
 export async function loadAuthStateFile(
   path: string
 ): Promise<PersistedAuthState | null> {
+  let data: string;
   try {
-    const data = await fs.readFile(path, "utf-8");
-    const parsed = JSON.parse(data) as PersistedAuthState;
-    return parsed;
+    data = await fs.readFile(path, "utf-8");
+  } catch (error) {
+    // No file is the normal signed-out state; anything else (permissions, a
+    // folder in the way) would otherwise look the same, so say so
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(
+        `Could not read the saved Mac.Bid session: ${(error as Error).message}`
+      );
+    }
+    return null;
+  }
+  try {
+    return JSON.parse(data) as PersistedAuthState;
   } catch {
+    // The content is not logged: it holds tokens
+    console.error("The saved Mac.Bid session is not valid JSON; treating it as signed out");
     return null;
   }
 }
@@ -22,7 +35,16 @@ export async function saveAuthStateFile(
   path: string,
   state: PersistedAuthState
 ): Promise<void> {
-  await fs.writeFile(path, JSON.stringify(state, null, 2), "utf-8");
+  // Session tokens: readable by the owner only. Written to a temporary file and
+  // renamed, so a crash mid-write cannot leave a truncated tokens.json.
+  const temporary = `${path}.${process.pid}.tmp`;
+  await fs.writeFile(temporary, JSON.stringify(state, null, 2), {
+    encoding: "utf-8",
+    mode: 0o600,
+  });
+  await fs.rename(temporary, path);
+  // mode only applies when the file is created: tighten one that already exists
+  await fs.chmod(path, 0o600);
 }
 
 export async function clearAuthStateFile(path: string): Promise<void> {
@@ -34,6 +56,21 @@ export function toAuthInfo(state: PersistedAuthState | null): Partial<AuthInfo> 
     return {};
   }
   return MacBid.parseAuthState(state);
+}
+
+export function hasPersistedTokens(state: PersistedAuthState | null): boolean {
+  return !!(state?.token || state?.refresh_token);
+}
+
+export function isRefreshTokenExpired(state: PersistedAuthState | null): boolean {
+  if (!state?.refresh_token_expiration) {
+    return !hasPersistedTokens(state);
+  }
+  return Date.now() >= new Date(state.refresh_token_expiration).getTime();
+}
+
+export function hasActiveSession(state: PersistedAuthState | null): boolean {
+  return hasPersistedTokens(state) && !isRefreshTokenExpired(state);
 }
 
 /**
@@ -65,6 +102,24 @@ export function reconcileValidationCode(
   }
 
   return { state: saved, cleared: false };
+}
+
+/** Avoid overwriting valid tokens when a re-login or code validation fails. */
+export function shouldPersistAuthState(
+  apiState: SerializableAuthState,
+  previous: PersistedAuthState | null
+): boolean {
+  const apiHasTokens = !!(apiState.token || apiState.refresh_token);
+  if (apiHasTokens) {
+    return true;
+  }
+
+  const previousHasTokens = !!(previous?.token || previous?.refresh_token);
+  if (previousHasTokens) {
+    return false;
+  }
+
+  return !!apiState.device_id;
 }
 
 export function mergePersistedAuthState(

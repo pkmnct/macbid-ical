@@ -80,8 +80,11 @@ web_modules/
 .env
 .env.test
 
-# MacBid token persistence
+# MacBid persistent data (tokens, TLS)
+data/
 .macbid-tokens.json
+.macbid-credentials.json
+.macbid-tls/
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -127,8 +130,3 @@ dist
 
 # macOS
 .DS_Store
-
-# Ignore output files
-!out/
-out/*
-!out/upcDb

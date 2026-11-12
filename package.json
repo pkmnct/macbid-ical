@@ -1,6 +1,6 @@
 {
     "name": "macbid-ical",
-    "version": "0.2.0",
+    "version": "1.1.0",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/pkmnct/macbid-ical.git"
@@ -14,28 +14,27 @@
         "node": "22 || >=24"
     },
     "dependencies": {
-        "dotenv": "^17.4.2",
         "ical-generator": "^11.0.0",
-        "macbid-ts-api": "1.0.0"
+        "macbid-ts-api": "^2.0.0"
     },
     "devDependencies": {
         "@eslint/js": "^10.0.1",
-        "eslint": "^10.5.0",
+        "@types/node": "^22.0.0",
+        "eslint": "^10.14.0",
         "eslint-plugin-promise": "^7.3.0",
-        "ts-node": "^10.9.2",
         "typescript": "^6.0.3",
-        "typescript-eslint": "^8.61.1"
+        "typescript-eslint": "^8.72.2"
     },
     "scripts": {
         "build": "tsc",
-        "dev": "ts-node --esm index.ts",
+        "typecheck": "tsc --noEmit",
         "lint": "eslint .",
+        "test": "tsc && node --test \"*.test.js\"",
+        "dev": "npm run build && node index.js",
         "start": "node index.js",
-        "predocker:build": "npm run build",
         "docker:build": "docker build -t macbid-ical .",
-        "docker:tag": "docker tag macbid-ical pkmnct/macbid-ical:latest",
-        "docker:push": "docker push pkmnct/macbid-ical:latest",
-        "docker": "npm run docker:build && npm run docker:tag && npm run docker:push"
+        "docker:setup": "docker buildx inspect macbid-multiarch >/dev/null 2>&1 || docker buildx create --name macbid-multiarch --driver docker-container --bootstrap --use",
+        "docker": "npm run docker:setup && docker buildx build --builder macbid-multiarch --platform linux/amd64,linux/arm64 -t pkmnct/macbid-ical:latest --push ."
     },
     "main": "index.js",
     "type": "module"
