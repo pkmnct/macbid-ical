@@ -29,6 +29,7 @@
         "build": "tsc",
         "typecheck": "tsc --noEmit",
         "lint": "eslint .",
+        "test": "tsc && node --test macbidTime.test.js pickupEvents.test.js",
         "dev": "npm run build && node index.js",
         "start": "node index.js",
         "docker:build": "docker build -t macbid-ical .",

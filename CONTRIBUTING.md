@@ -7,11 +7,12 @@ npm install
 npm run dev        # compile, then run (reads .env)
 npm run typecheck
 npm run lint
+npm test           # time conversion and pickup-day tests
 npm run build      # compile to JS
 npm start          # run compiled output
 ```
 
-Run lint, typecheck and build before opening a pull request. CI runs the same checks.
+Run lint, typecheck, tests and build before opening a pull request. CI runs the same checks.
 
 ## How it works
 
@@ -51,6 +52,6 @@ data/
 
 ## Automation
 
-- **CI** (`.github/workflows/ci.yml`): lint, type-check and build on Node 22, 24 and 26, `npm audit` of production dependencies, and an image build with `scripts/smoke-test.sh` on every pull request and push to `main`.
-- **Publish** (`.github/workflows/publish.yml`): runs lint and typecheck, then builds, smoke-tests and pushes `pkmnct/macbid-ical:latest` plus a dated tag for amd64 and arm64 on every push to `main`, every Wednesday (so base-image security patches arrive without a code change), and on demand. Needs the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+- **CI** (`.github/workflows/ci.yml`): lint, type-check, tests and build on Node 22, 24 and 26, `npm audit` of production dependencies, and an image build with `scripts/smoke-test.sh` on every pull request and push to `main`.
+- **Publish** (`.github/workflows/publish.yml`): runs lint, typecheck and tests, then builds, smoke-tests and pushes `pkmnct/macbid-ical:latest` plus a dated tag for amd64 and arm64 on every push to `main`, every Wednesday (so base-image security patches arrive without a code change), and on demand. Needs the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
 - **Dependabot** (`.github/dependabot.yml`): weekly grouped updates for npm, the Docker base image and GitHub Actions. Patch and minor npm and Docker updates merge themselves once CI passes; this relies on branch protection on `main` requiring the CI checks and "Allow auto-merge" being on. Those merges do not start a publish run by themselves, so they ship with the next weekly rebuild.

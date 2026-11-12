@@ -35,6 +35,7 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run build
+      - run: npm test
       # Only what ships in the image; fails on high or critical advisories
       - run: npm audit --omit=dev --audit-level=high
 

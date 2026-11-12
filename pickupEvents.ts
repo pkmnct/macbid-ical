@@ -1,7 +1,11 @@
 import type { ActiveItem, Building, Location } from "macbid-ts-api";
-import { macbidWallClockToDate } from "./macbidTime.js";
+import {
+  MACBID_TIMEZONE,
+  macbidWallClockToDate,
+  wallClockToDate,
+} from "./macbidTime.js";
 
-const TIMEZONE = "America/New_York";
+const TIMEZONE = MACBID_TIMEZONE;
 
 const HOURS_LINE =
   /^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+(\d{1,2}:\d{2}(?:am|pm))\s*-\s*(\d{1,2}:\d{2}(?:am|pm))$/i;
@@ -71,49 +75,24 @@ export function parseTime12h(time: string): { hour: number; minute: number } {
   return { hour, minute };
 }
 
+/** A store-hours time ("12:00pm") on a date ("2026-11-13") in `timeZone`. */
 export function zonedLocalToDate(
   dateStr: string,
   time12h: string,
   timeZone: string,
 ): Date {
   const { hour, minute } = parseTime12h(time12h);
-  const year = parseInt(dateStr.slice(0, 4), 10);
-  const month = parseInt(dateStr.slice(5, 7), 10);
-  const day = parseInt(dateStr.slice(8, 10), 10);
-
-  let utc = Date.UTC(year, month - 1, day, hour, minute, 0);
-  const formatter = new Intl.DateTimeFormat("en-US", {
+  return wallClockToDate(
+    {
+      year: parseInt(dateStr.slice(0, 4), 10),
+      month: parseInt(dateStr.slice(5, 7), 10),
+      day: parseInt(dateStr.slice(8, 10), 10),
+      hour,
+      minute,
+      second: 0,
+    },
     timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-
-  const targetUtc = Date.UTC(year, month - 1, day, hour, minute, 0);
-
-  for (let i = 0; i < 4; i++) {
-    const parts = Object.fromEntries(
-      formatter
-        .formatToParts(new Date(utc))
-        .filter((part) => part.type !== "literal")
-        .map((part) => [part.type, part.value]),
-    );
-    const actualUtc = Date.UTC(
-      parseInt(parts.year!, 10),
-      parseInt(parts.month!, 10) - 1,
-      parseInt(parts.day!, 10),
-      parseInt(parts.hour!, 10),
-      parseInt(parts.minute!, 10),
-      parseInt(parts.second!, 10),
-    );
-    utc += targetUtc - actualUtc;
-  }
-
-  return new Date(utc);
+  );
 }
 
 const WEEKDAYS = [
@@ -171,7 +150,17 @@ export function resolvePickupDay(
     if (hours) {
       const date = day.toISOString().slice(0, 10);
       const opensAt = zonedLocalToDate(date, hours.open, tz).getTime();
-      const closesAt = zonedLocalToDate(date, hours.close, tz).getTime();
+      let closesAt = zonedLocalToDate(date, hours.close, tz).getTime();
+      if (closesAt <= opensAt) {
+        // "12:00am" as a closing time means the end of this day, not its start
+        const next = new Date(day);
+        next.setUTCDate(next.getUTCDate() + 1);
+        closesAt = zonedLocalToDate(
+          next.toISOString().slice(0, 10),
+          hours.close,
+          tz,
+        ).getTime();
+      }
       if (abandonAt === null || opensAt < abandonAt) {
         const endsAtAbandon = abandonAt !== null && abandonAt < closesAt;
         return {
