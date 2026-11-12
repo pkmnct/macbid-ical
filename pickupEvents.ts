@@ -1,4 +1,5 @@
 import type { ActiveItem, Building, Location } from "macbid-ts-api";
+import { macbidWallClockToDate } from "./macbidTime.js";
 
 const TIMEZONE = "America/New_York";
 
@@ -47,27 +48,6 @@ export function parseStoreHours(
   }
 
   return map;
-}
-
-export function abandonDateInTimeZone(
-  iso: string,
-  tz: string,
-): { date: string; weekday: string } {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    weekday: "long",
-  }).formatToParts(new Date(iso));
-
-  const get = (type: Intl.DateTimeFormatPartTypes): string =>
-    parts.find((part) => part.type === type)?.value ?? "";
-
-  return {
-    date: `${get("year")}-${get("month")}-${get("day")}`,
-    weekday: get("weekday"),
-  };
 }
 
 export function parseTime12h(time: string): { hour: number; minute: number } {
@@ -136,20 +116,26 @@ export function zonedLocalToDate(
   return new Date(utc);
 }
 
-function addDaysInTimeZone(
-  dateStr: string,
-  days: number,
-  timeZone: string,
-): string {
-  const noon = zonedLocalToDate(dateStr, "12:00pm", timeZone);
-  const shifted = new Date(noon.getTime() + days * 86_400_000);
-  return abandonDateInTimeZone(shifted.toISOString(), timeZone).date;
-}
+const WEEKDAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
 
 /**
- * The last day the store is open before items are abandoned: the abandon day
- * itself counts only if the store opens before the abandon time, and then the
- * window ends at whichever comes first, closing or abandonment.
+ * The day to collect won items, and when the pickup window is open on it.
+ *
+ * Mac.Bid's abandon date is Eastern wall-clock digits marked "Z" (see
+ * macbidTime.ts). At midnight it is a plain date: the last day to pick up (an
+ * auction with `pickup_date: "Monday (11/16)"` has `abandon_date`
+ * `2026-11-16T00:00:00.000Z`), so that day's store hours count in full. If it
+ * carries a time of day, items are abandoned at that moment, and the window
+ * ends then if that comes before the store closes. When the store is closed
+ * on the last day, the previous open day is used.
  */
 export function resolvePickupDay(
   abandonIso: string,
@@ -164,33 +150,41 @@ export function resolvePickupDay(
   /** The window ends at the abandon time, before the store closes. */
   endsAtAbandon: boolean;
 } | null {
-  const abandonAt = new Date(abandonIso).getTime();
-  if (Number.isNaN(abandonAt)) {
+  const digits = new Date(abandonIso);
+  if (Number.isNaN(digits.getTime())) {
     return null;
   }
-  let { date, weekday } = abandonDateInTimeZone(abandonIso, tz);
+  const dateOnly =
+    digits.getUTCHours() === 0 &&
+    digits.getUTCMinutes() === 0 &&
+    digits.getUTCSeconds() === 0;
+  const abandonAt = dateOnly ? null : macbidWallClockToDate(digits, tz).getTime();
+
+  // Calendar arithmetic on the digits, with no timezone involved
+  const day = new Date(
+    Date.UTC(digits.getUTCFullYear(), digits.getUTCMonth(), digits.getUTCDate()),
+  );
 
   for (let i = 0; i < 8; i++) {
+    const weekday = WEEKDAYS[day.getUTCDay()]!;
     const hours = hoursMap.get(weekday);
     if (hours) {
+      const date = day.toISOString().slice(0, 10);
       const opensAt = zonedLocalToDate(date, hours.open, tz).getTime();
       const closesAt = zonedLocalToDate(date, hours.close, tz).getTime();
-      if (opensAt < abandonAt) {
+      if (abandonAt === null || opensAt < abandonAt) {
+        const endsAtAbandon = abandonAt !== null && abandonAt < closesAt;
         return {
           date,
           weekday,
           hours,
           start: new Date(opensAt),
-          end: new Date(Math.min(closesAt, abandonAt)),
-          endsAtAbandon: abandonAt < closesAt,
+          end: new Date(endsAtAbandon ? abandonAt : closesAt),
+          endsAtAbandon,
         };
       }
     }
-    date = addDaysInTimeZone(date, -1, tz);
-    weekday = abandonDateInTimeZone(
-      zonedLocalToDate(date, "12:00pm", tz).toISOString(),
-      tz,
-    ).weekday;
+    day.setUTCDate(day.getUTCDate() - 1);
   }
 
   return null;
