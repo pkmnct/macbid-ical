@@ -44,6 +44,7 @@ import {
   createMacbidCalendar,
   sendCalendarResponse,
 } from "./feedCalendar.js";
+import { macbidWallClockToDate } from "./macbidTime.js";
 import { buildPickupEvents } from "./pickupEvents.js";
 import {
   authStatePath,
@@ -535,7 +536,8 @@ function activeEmailHint(
         );
         return;
       }
-      const eventDate = new Date(closes.getTime() + 60 * 60 * 1000);
+      // Mac.Bid's times are Eastern wall-clock digits marked "Z": see macbidTime.ts
+      const eventDate = macbidWallClockToDate(closes);
 
       calendar.createEvent({
         id: `macbid-watchlist-${favorite.auction_lot_id}`,
