@@ -44,7 +44,6 @@ import {
   createMacbidCalendar,
   sendCalendarResponse,
 } from "./feedCalendar.js";
-import { macbidWallClockToDate } from "./macbidTime.js";
 import { buildPickupEvents } from "./pickupEvents.js";
 import {
   authStatePath,
@@ -54,6 +53,7 @@ import {
 } from "./dataDir.js";
 import { loadTlsMaterials } from "./tls.js";
 import { appVersion } from "./version.js";
+import { resolveWatchlistCloses } from "./watchlistCloseTimes.js";
 
 // Load a local .env when there is one (development); containers pass real env vars
 try {
@@ -469,12 +469,17 @@ function activeEmailHint(
         }
         let fetched;
         try {
-          fetched = await Promise.all([
+          const [favorites, ...rest] = await Promise.all([
             api.get_watchlist(),
             api.get_active(),
             api.get_locations(),
             api.get_buildings(),
           ]);
+          // The watchlist's own close dates are wrong: each lot's end_time is
+          // the real close (see watchlistCloseTimes.ts). Inside this try, so a
+          // sign-in failure here is handled like any other
+          const watchlist = await resolveWatchlistCloses(favorites, api.get_lot);
+          fetched = [watchlist, ...rest] as const;
         } catch (error) {
           if (error instanceof MacBidAuthError) {
             // The library has dropped the session; forget the saved copy too,
@@ -486,11 +491,11 @@ function activeEmailHint(
           }
           throw error;
         }
-        const [favorites, activeItems, locations, buildings] = fetched;
+        const [watchlist, activeItems, locations, buildings] = fetched;
         await persistFromApi(api.getAuthState());
         const refreshTokenExpiration = await api.get_refresh_token_expiration();
         return {
-          favorites,
+          watchlist,
           activeItems,
           locations,
           buildings,
@@ -526,23 +531,11 @@ function activeEmailHint(
       url: renewUrl,
     });
 
-    data.favorites.forEach((favorite) => {
-      // new Date(null) is the epoch, not an invalid date: check for a value too
-      const closes = new Date(favorite.expected_close_date);
-      if (!favorite.expected_close_date || Number.isNaN(closes.getTime())) {
-        // One odd item must not take the whole feed down
-        console.warn(
-          `Skipping watchlist item ${favorite.auction_lot_id}: invalid close date`
-        );
-        return;
-      }
-      // Mac.Bid's times are Eastern wall-clock digits marked "Z": see macbidTime.ts
-      const eventDate = macbidWallClockToDate(closes);
-
+    data.watchlist.forEach(({ favorite, closes }) => {
       calendar.createEvent({
         id: `macbid-watchlist-${favorite.auction_lot_id}`,
-        start: eventDate,
-        end: eventDate,
+        start: closes,
+        end: closes,
         summary: favorite.title,
         description: `This item is ending on Mac.bid at this time. Make sure to set a notification. The item is here: https://www.mac.bid/auction/${favorite.auction_number}/lot/${favorite.lot_number}`,
       });
@@ -571,7 +564,8 @@ function activeEmailHint(
     return { signedIn: true, body: calendar.toString() };
   };
 
-  // Each build is a session check plus four Mac.Bid requests. Share one build
+  // Each build is a session check, four Mac.Bid requests and one per watchlist
+  // lot (a few at a time). Share one build
   // between concurrent requests and reuse it for a few minutes, so calendar
   // apps polling the feed cannot hammer the account.
   const getFeed = async (): Promise<string> => {

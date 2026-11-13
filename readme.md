@@ -2,7 +2,7 @@
 
 Serve an iCal feed of your [Mac.Bid](https://www.mac.bid) watchlist and pickup windows for Apple Calendar, Google Calendar, or any app that subscribes to `.ics` URLs.
 
-- Each watchlist item becomes an event at its expected close time, with a link to the lot.
+- Each watchlist item becomes an event at the lot's real close time (including late-bid extensions, as of the last feed refresh), with a link to the lot.
 - Won items awaiting pickup become one event per pickup window and building, ending at the store's closing time or the abandon time, whichever comes first. The description lists the warehouse slot codes.
 - A reminder event is added for when your Mac.Bid session expires.
 

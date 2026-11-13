@@ -1,10 +1,18 @@
 /**
- * Mac.Bid writes its times as ISO strings that end in "Z" but are not UTC:
+ * Many of Mac.Bid's times are ISO strings that end in "Z" but are not UTC:
  * the digits are the Eastern wall-clock time the site shows (a lot with
  * `closed_date: "2026-11-11T19:38:53.000Z"` is shown as "7:38 PM", and its
  * last bid, written as a real UTC instant, is 2026-11-12T00:37:53Z). Reading
  * them as UTC, or adding an hour for daylight saving, puts events at the wrong
- * time. This module turns wall-clock digits into the real instant.
+ * time. This module turns wall-clock digits into the real instant; pickup
+ * events use it for `abandon_date`.
+ *
+ * Not every field follows this. The watchlist's `expected_close_date` has
+ * digits an hour ahead of Eastern time (lot 2230R, shown closing at 7:35:59 PM
+ * EST on 16 Nov 2026, came back as "2026-11-16T20:35:59Z") and ignores bid
+ * extensions, so watchlist events use the lot's real UTC `end_time` instead:
+ * see watchlistCloseTimes.ts. Check a field against the site before
+ * assuming it is Eastern wall-clock time.
  */
 export const MACBID_TIMEZONE = "America/New_York";
 

@@ -16,7 +16,8 @@ Run lint, typecheck, tests and build before opening a pull request. CI runs the 
 
 ## How it works
 
-- [`macbid-ts-api`](https://github.com/pkmnct/macbid-ts-api) (2.x) handles authentication, the watchlist, active won items, locations and buildings.
+- [`macbid-ts-api`](https://github.com/pkmnct/macbid-ts-api) (2.1+) handles authentication, the watchlist, lot lookups, active won items, locations and buildings.
+- Watchlist events are timed from each lot's `end_time` (`get_lot`, a few lots at a time), not the watchlist's `expected_close_date`, which runs an hour ahead of Eastern time and ignores bid extensions. See `watchlistCloseTimes.ts`.
 - Session state is saved to `data/tokens.json` (mode `0600`, written through a temporary file and renamed). Email and password are only held in memory.
 - Feed builds, startup sign-in and web sign-in run one at a time (`withAuthLock` in `index.ts`), so they cannot overwrite each other's saved state.
 - Only a failed sign-in becomes the "Sign-In Required" all-day event. Any other failure (bad response, Mac.Bid down) returns `502`, so calendar apps keep their existing events.
