@@ -9,8 +9,11 @@ import {
 } from "macbid-ts-api";
 import {
   LOT_LOOKUP_CONCURRENCY,
+  MAX_RETRY_WAIT_MS,
+  MIN_LOTS_FOR_API_CHANGE,
   mapWithConcurrency,
   resolveWatchlistCloses,
+  settleAll,
 } from "./watchlistCloseTimes.js";
 
 // Lot 2230R (Magnet Maker), as Mac.Bid answered on 13 Nov 2026. The site shows
@@ -39,7 +42,11 @@ const notFound = (lotId: number) =>
     path: `/lot/${lotId}`,
   });
 
-const quiet = { warn: () => undefined };
+const noSleep = async () => undefined;
+const quiet = { warn: () => undefined, sleep: noSleep };
+const ok = (lotId: number) => lotStatus(lotId, "2026-11-17T00:35:59.000Z");
+const unavailable = (retryAfterMs?: number) =>
+  new MacBidUnavailableError("Mac.Bid returned HTTP 429", { retryAfterMs });
 
 describe("resolveWatchlistCloses", () => {
   it("times lot 2230R from get_lot's end_time, not expected_close_date", async () => {
@@ -108,17 +115,38 @@ describe("resolveWatchlistCloses", () => {
     assert.match(warnings[0]!, /watchlist item 2\b/);
   });
 
-  it("throws when every lot is missing: the endpoint has likely moved", async () => {
-    await assert.rejects(
-      resolveWatchlistCloses(
-        [favorite(1), favorite(2)],
+  it("throws when no lot of a longer watchlist can be read: the endpoint has likely moved", async () => {
+    assert.equal(MIN_LOTS_FOR_API_CHANGE, 3);
+    for (const failure of [
+      notFound,
+      () => new Error("Mac.Bid lot response has no usable end_time; the API may have changed"),
+    ]) {
+      await assert.rejects(
+        resolveWatchlistCloses(
+          [favorite(1), favorite(2), favorite(3)],
+          async (lotId) => {
+            throw failure(lotId);
+          },
+          quiet
+        ),
+        /None of the 3 watchlist lots could be looked up/
+      );
+    }
+  });
+
+  it("keeps the feed going when a short watchlist's only lots were removed", async () => {
+    for (const lots of [[favorite(1)], [favorite(1), favorite(2)]]) {
+      const warnings: string[] = [];
+      const closes = await resolveWatchlistCloses(
+        lots,
         async (lotId) => {
           throw notFound(lotId);
         },
-        quiet
-      ),
-      /None of the 2 watchlist lots could be looked up/
-    );
+        { ...quiet, warn: (message) => warnings.push(message) }
+      );
+      assert.deepEqual(closes, []);
+      assert.equal(warnings.length, lots.length);
+    }
   });
 
   it("is an empty list for an empty watchlist, without asking for any lot", async () => {
@@ -130,37 +158,125 @@ describe("resolveWatchlistCloses", () => {
     assert.deepEqual(closes, []);
   });
 
-  it("passes sign-in, outage and other errors through unchanged", async () => {
+  it("skips one odd lot instead of failing the feed, never using expected_close_date", async () => {
     for (const error of [
-      new MacBidAuthError("Mac.Bid returned HTTP 401", { status: 401 }),
-      new MacBidUnavailableError("Mac.Bid returned HTTP 503"),
       new Error("Mac.Bid lot response has no usable end_time; the API may have changed"),
+      new Error("Not a Mac.Bid lot id: 0"),
     ]) {
-      await assert.rejects(
-        resolveWatchlistCloses(
-          [favorite(1), favorite(2)],
-          async (lotId) => {
-            if (lotId === 2) {
-              throw error;
-            }
-            return lotStatus(lotId, "2026-11-17T00:35:59.000Z");
-          },
-          quiet
-        ),
-        (thrown) => thrown === error
+      const warnings: string[] = [];
+      const closes = await resolveWatchlistCloses(
+        [MAGNET_MAKER, favorite(2)],
+        async (lotId) => {
+          if (lotId === MAGNET_MAKER.auction_lot_id) {
+            throw error;
+          }
+          return ok(lotId);
+        },
+        { ...quiet, warn: (message) => warnings.push(message) }
       );
+      assert.deepEqual(
+        closes.map((close) => close.favorite.auction_lot_id),
+        [2]
+      );
+      assert.equal(warnings.length, 1);
+      assert.ok(warnings[0]!.includes(error.message));
     }
   });
 
-  it("does not fall back to expected_close_date when end_time is unreadable", async () => {
+  it("passes a sign-in failure through unchanged", async () => {
+    const error = new MacBidAuthError("Mac.Bid returned HTTP 401", { status: 401 });
     await assert.rejects(
       resolveWatchlistCloses(
-        [MAGNET_MAKER],
-        async (lotId) => lotStatus(lotId, "soon"),
+        [favorite(1), favorite(2)],
+        async (lotId) => {
+          if (lotId === 2) {
+            throw error;
+          }
+          return ok(lotId);
+        },
         quiet
       ),
-      /unreadable end_time/
+      (thrown) => thrown === error
     );
+  });
+
+  it("retries a rate-limited lot once, waiting as asked up to a cap", async () => {
+    for (const [retryAfterMs, waited] of [
+      [2_000, 2_000],
+      [60_000, MAX_RETRY_WAIT_MS],
+      [undefined, 1_000],
+    ] as const) {
+      const waits: number[] = [];
+      let calls = 0;
+      const [close] = await resolveWatchlistCloses(
+        [MAGNET_MAKER],
+        async (lotId) => {
+          if (calls++ === 0) {
+            throw unavailable(retryAfterMs);
+          }
+          return ok(lotId);
+        },
+        { ...quiet, sleep: async (ms) => void waits.push(ms) }
+      );
+      assert.equal(calls, 2);
+      assert.deepEqual(waits, [waited]);
+      assert.equal(close!.closes.toISOString(), "2026-11-17T00:35:59.000Z");
+    }
+  });
+
+  it("uses the last known close time when a lot stays unavailable", async () => {
+    const lastKnown = new Map<number, Date>();
+    await resolveWatchlistCloses([MAGNET_MAKER, favorite(2)], async (lotId) => ok(lotId), {
+      ...quiet,
+      lastKnown,
+    });
+    assert.equal(lastKnown.get(67826120)?.toISOString(), "2026-11-17T00:35:59.000Z");
+
+    const warnings: string[] = [];
+    const closes = await resolveWatchlistCloses(
+      [MAGNET_MAKER, favorite(2)],
+      async (lotId) => {
+        if (lotId === MAGNET_MAKER.auction_lot_id) {
+          throw unavailable();
+        }
+        return lotStatus(lotId, "2026-11-17T01:00:00.000Z");
+      },
+      { ...quiet, lastKnown, warn: (message) => warnings.push(message) }
+    );
+    assert.deepEqual(
+      closes.map((close) => [close.favorite.auction_lot_id, close.closes.toISOString()]),
+      [
+        [67826120, "2026-11-17T00:35:59.000Z"],
+        [2, "2026-11-17T01:00:00.000Z"],
+      ]
+    );
+    assert.match(warnings[0]!, /last known close time/);
+  });
+
+  it("fails the build when a lot stays unavailable and was never read", async () => {
+    const error = unavailable();
+    await assert.rejects(
+      resolveWatchlistCloses(
+        [favorite(1), favorite(2)],
+        async (lotId) => {
+          if (lotId === 2) {
+            throw error;
+          }
+          return ok(lotId);
+        },
+        { ...quiet, lastKnown: new Map() }
+      ),
+      (thrown) => thrown === error
+    );
+  });
+
+  it("forgets lots that are no longer watched", async () => {
+    const lastKnown = new Map([[99, new Date("2026-11-01T00:00:00Z")]]);
+    await resolveWatchlistCloses([favorite(1)], async (lotId) => ok(lotId), {
+      ...quiet,
+      lastKnown,
+    });
+    assert.deepEqual([...lastKnown.keys()], [1]);
   });
 
   it("looks up at most four lots at a time", async () => {
@@ -205,6 +321,26 @@ describe("mapWithConcurrency", () => {
     }
   });
 
+  it("waits for the calls already running before it rejects", async () => {
+    let running = 0;
+    await assert.rejects(
+      mapWithConcurrency([1, 2, 3, 4], 4, async (item) => {
+        running++;
+        try {
+          if (item === 1) {
+            throw new Error("boom");
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return item;
+        } finally {
+          running--;
+        }
+      }),
+      /boom/
+    );
+    assert.equal(running, 0);
+  });
+
   it("starts nothing new after a failure", async () => {
     const started: number[] = [];
     await assert.rejects(
@@ -220,5 +356,34 @@ describe("mapWithConcurrency", () => {
     );
     // 1 and 2 ran together; 2's worker may have picked up 3 before 1 failed
     assert.ok(started.length <= 3, String(started));
+  });
+});
+
+describe("settleAll", () => {
+  it("returns every value in order", async () => {
+    assert.deepEqual(await settleAll([Promise.resolve(1), Promise.resolve("a")]), [1, "a"]);
+  });
+
+  it("lets everything finish before it rejects", async () => {
+    let finished = false;
+    await assert.rejects(
+      settleAll([
+        Promise.reject(new Error("first")),
+        (async () => {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          finished = true;
+        })(),
+      ]),
+      /first/
+    );
+    assert.ok(finished);
+  });
+
+  it("throws a sign-in failure ahead of other errors", async () => {
+    const auth = new MacBidAuthError("Mac.Bid returned HTTP 401", { status: 401 });
+    await assert.rejects(
+      settleAll([Promise.reject(new Error("other")), Promise.reject(auth)]),
+      (thrown) => thrown === auth
+    );
   });
 });

@@ -53,7 +53,7 @@ import {
 } from "./dataDir.js";
 import { loadTlsMaterials } from "./tls.js";
 import { appVersion } from "./version.js";
-import { resolveWatchlistCloses } from "./watchlistCloseTimes.js";
+import { resolveWatchlistCloses, settleAll } from "./watchlistCloseTimes.js";
 
 // Load a local .env when there is one (development); containers pass real env vars
 try {
@@ -147,6 +147,9 @@ function activeEmailHint(
   const cacheSeconds = cacheSecondsFromEnv();
   let cachedFeed: { body: string; expires: number } | undefined;
   let pendingFeed: Promise<FeedResult> | undefined;
+  // Each watched lot's last close time from Mac.Bid, for when a lookup is
+  // rate-limited (see watchlistCloseTimes.ts)
+  const lastKnownCloses = new Map<number, Date>();
 
   // Feed builds, sign-in and startup all share one Mac.Bid client and the
   // saved auth state. Run them one at a time so none sees another's half-done
@@ -469,17 +472,20 @@ function activeEmailHint(
         }
         let fetched;
         try {
-          const [favorites, ...rest] = await Promise.all([
-            api.get_watchlist(),
+          // The watchlist's own close dates are wrong: each lot's end_time is
+          // the real close (see watchlistCloseTimes.ts). The lookups start as
+          // soon as the watchlist is in. Everything settles before this lock
+          // is released, so no request outlives it.
+          fetched = await settleAll([
+            api.get_watchlist().then((favorites) =>
+              resolveWatchlistCloses(favorites, api.get_lot, {
+                lastKnown: lastKnownCloses,
+              })
+            ),
             api.get_active(),
             api.get_locations(),
             api.get_buildings(),
           ]);
-          // The watchlist's own close dates are wrong: each lot's end_time is
-          // the real close (see watchlistCloseTimes.ts). Inside this try, so a
-          // sign-in failure here is handled like any other
-          const watchlist = await resolveWatchlistCloses(favorites, api.get_lot);
-          fetched = [watchlist, ...rest] as const;
         } catch (error) {
           if (error instanceof MacBidAuthError) {
             // The library has dropped the session; forget the saved copy too,

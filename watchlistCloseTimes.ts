@@ -1,5 +1,6 @@
 import {
-  MacBidNotFoundError,
+  MacBidAuthError,
+  MacBidUnavailableError,
   type LotStatus,
   type WatchlistFull,
 } from "macbid-ts-api";
@@ -16,14 +17,63 @@ import {
 /** How many `get_lot` requests run at once: a burst can get a 429. */
 export const LOT_LOOKUP_CONCURRENCY = 4;
 
+/**
+ * With at least this many lots and none of them readable, the lot endpoint has
+ * likely moved, and the build fails rather than drop every watchlist event.
+ * Below it, all lots failing is as likely to be lots that were removed (one
+ * watched lot, taken down), and the rest of the feed must keep updating.
+ */
+export const MIN_LOTS_FOR_API_CHANGE = 3;
+
+/** Longest wait before retrying a lot Mac.Bid rate-limited or failed on. */
+export const MAX_RETRY_WAIT_MS = 5_000;
+const DEFAULT_RETRY_WAIT_MS = 1_000;
+
 export interface WatchlistClose {
   favorite: WatchlistFull;
   closes: Date;
 }
 
+export interface ResolveOptions {
+  concurrency?: number;
+  warn?: (message: string) => void;
+  /**
+   * Each lot's last close time read from Mac.Bid, kept between builds. Used
+   * when a lot's lookup is still unavailable after a retry, instead of failing
+   * the build. Updated in place; lots no longer watched are dropped.
+   */
+  lastKnown?: Map<number, Date>;
+  /** For tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+const defaultSleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Settle every promise, then return all values or throw. Nothing is left
+ * running when this returns, so callers holding a lock can release it safely.
+ * A sign-in failure wins over other errors, so the session is dealt with.
+ */
+export async function settleAll<T extends readonly unknown[]>(
+  promises: readonly [...{ [K in keyof T]: Promise<T[K]> }]
+): Promise<T> {
+  const settled = await Promise.allSettled(promises);
+  const failures = settled.flatMap((result) =>
+    result.status === "rejected" ? [result.reason as unknown] : []
+  );
+  if (failures.length > 0) {
+    throw failures.find((error) => error instanceof MacBidAuthError) ?? failures[0];
+  }
+  return settled.map(
+    (result) => (result as PromiseFulfilledResult<unknown>).value
+  ) as unknown as T;
+}
+
 /**
  * `fn` over `items`, at most `limit` at a time, results in input order. After
- * the first failure no new item is started, and that failure is thrown.
+ * a failure no new item is started; once the ones already running have
+ * finished, the first failure is thrown.
  */
 export async function mapWithConcurrency<T, R>(
   items: readonly T[],
@@ -33,30 +83,42 @@ export async function mapWithConcurrency<T, R>(
   const results = new Array<R>(items.length);
   let next = 0;
   let failed = false;
+  let firstError: unknown;
   const worker = async (): Promise<void> => {
     while (!failed && next < items.length) {
       const index = next++;
       try {
         results[index] = await fn(items[index]!, index);
       } catch (error) {
-        failed = true;
-        throw error;
+        if (!failed) {
+          failed = true;
+          firstError = error;
+        }
       }
     }
   };
   const workers = Math.max(1, Math.min(limit, items.length));
   await Promise.all(Array.from({ length: workers }, worker));
+  if (failed) {
+    throw firstError;
+  }
   return results;
 }
 
 /**
  * Each watchlist item with its lot's real close time.
  *
- * A lot that Mac.Bid no longer has (`MacBidNotFoundError`) is skipped with a
- * warning. Any other error is thrown as it is, so sign-in and outage errors
- * keep their usual handling. If no lot of a non-empty watchlist could be
- * looked up, the lot endpoint has likely changed: that is thrown too, rather
- * than serving a feed that silently lost every watchlist event.
+ * - A lot that cannot be read (removed, or an answer without a usable
+ *   `end_time`) is skipped with a warning, as one odd item must not take the
+ *   whole feed down.
+ * - A lot Mac.Bid is rate-limiting or failing on is retried once; if it still
+ *   fails, its last known close time is used, and without one the error is
+ *   thrown so the feed keeps its previous events.
+ * - Sign-in errors are thrown as they are, for their usual handling.
+ * - If a watchlist of `MIN_LOTS_FOR_API_CHANGE` or more lots has none that can
+ *   be read, the lot endpoint has likely changed: that is thrown too.
+ *
+ * `expected_close_date` is never used as a fallback: it is known to be wrong.
  */
 export async function resolveWatchlistCloses(
   favorites: readonly WatchlistFull[],
@@ -64,37 +126,67 @@ export async function resolveWatchlistCloses(
   {
     concurrency = LOT_LOOKUP_CONCURRENCY,
     warn = console.warn,
-  }: { concurrency?: number; warn?: (message: string) => void } = {}
+    lastKnown,
+    sleep = defaultSleep,
+  }: ResolveOptions = {}
 ): Promise<WatchlistClose[]> {
+  const fetchLot = async (lotId: number): Promise<LotStatus> => {
+    try {
+      return await getLot(lotId);
+    } catch (error) {
+      if (!(error instanceof MacBidUnavailableError)) {
+        throw error;
+      }
+      await sleep(
+        Math.min(error.retryAfterMs ?? DEFAULT_RETRY_WAIT_MS, MAX_RETRY_WAIT_MS)
+      );
+      return await getLot(lotId);
+    }
+  };
+
   const looked = await mapWithConcurrency(
     favorites,
     concurrency,
     async (favorite): Promise<WatchlistClose | null> => {
-      let lot: LotStatus;
+      const lotId = favorite.auction_lot_id;
       try {
-        lot = await getLot(favorite.auction_lot_id);
+        const lot = await fetchLot(lotId);
+        // get_lot has checked end_time is an ISO instant with a zone
+        const closes = new Date(lot.end_time);
+        lastKnown?.set(lotId, closes);
+        return { favorite, closes };
       } catch (error) {
-        if (error instanceof MacBidNotFoundError) {
-          warn(
-            `Skipping watchlist item ${favorite.auction_lot_id}: Mac.Bid has no such lot`
-          );
-          return null;
+        if (error instanceof MacBidAuthError) {
+          throw error;
         }
-        throw error;
+        const reason = error instanceof Error ? error.message : String(error);
+        if (error instanceof MacBidUnavailableError) {
+          const previous = lastKnown?.get(lotId);
+          if (!previous) {
+            throw error;
+          }
+          warn(
+            `Watchlist item ${lotId}: using its last known close time (${reason})`
+          );
+          return { favorite, closes: previous };
+        }
+        warn(`Skipping watchlist item ${lotId}: ${reason}`);
+        return null;
       }
-      const closes = new Date(lot.end_time);
-      if (Number.isNaN(closes.getTime())) {
-        // get_lot checks this already; an unreadable time means the API moved
-        throw new Error(
-          `Mac.Bid lot ${favorite.auction_lot_id} has an unreadable end_time; the API may have changed`
-        );
-      }
-      return { favorite, closes };
     }
   );
 
+  if (lastKnown) {
+    const watched = new Set(favorites.map((favorite) => favorite.auction_lot_id));
+    for (const lotId of lastKnown.keys()) {
+      if (!watched.has(lotId)) {
+        lastKnown.delete(lotId);
+      }
+    }
+  }
+
   const closes = looked.filter((item): item is WatchlistClose => item !== null);
-  if (favorites.length > 0 && closes.length === 0) {
+  if (favorites.length >= MIN_LOTS_FOR_API_CHANGE && closes.length === 0) {
     throw new Error(
       `None of the ${favorites.length} watchlist lots could be looked up; the Mac.Bid lot API may have changed`
     );
