@@ -270,6 +270,125 @@ describe("resolveWatchlistCloses", () => {
     );
   });
 
+  it("stops sending requests once a lot is still rate-limited after its retry", async () => {
+    const favorites = Array.from({ length: 12 }, (_, index) => favorite(index + 1));
+    const lastKnown = new Map(
+      favorites.map((item) => [item.auction_lot_id, new Date("2026-11-17T00:00:00Z")])
+    );
+    let calls = 0;
+    let waits = 0;
+    const warnings: string[] = [];
+    const closes = await resolveWatchlistCloses(
+      favorites,
+      async () => {
+        calls++;
+        throw unavailable(60_000);
+      },
+      {
+        lastKnown,
+        warn: (message) => warnings.push(message),
+        sleep: async () => {
+          waits++;
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        },
+      }
+    );
+    assert.equal(closes.length, 12);
+    // The first round of 4 tries and waits; at most those 4 retry
+    assert.ok(calls <= 8, `${calls} requests`);
+    assert.ok(waits <= 4, `${waits} waits`);
+    // One line for the rate limit, not one per lot
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /rate-limiting/);
+  });
+
+  it("does not treat a rate limit as an API change", async () => {
+    const favorites = [favorite(1), favorite(2), favorite(3)];
+    const lastKnown = new Map(
+      favorites.map((item) => [item.auction_lot_id, new Date("2026-11-17T00:00:00Z")])
+    );
+    const closes = await resolveWatchlistCloses(
+      favorites,
+      async () => {
+        throw unavailable();
+      },
+      { ...quiet, lastKnown }
+    );
+    assert.equal(closes.length, 3);
+  });
+
+  it("keeps a lot's last known time through a passing bad answer", async () => {
+    const lastKnown = new Map([[67826120, new Date("2026-11-17T00:35:59.000Z")]]);
+    const warnings: string[] = [];
+    const [close] = await resolveWatchlistCloses(
+      [MAGNET_MAKER],
+      async () => {
+        throw new Error("Mac.Bid returned a response that is not JSON");
+      },
+      { ...quiet, lastKnown, warn: (message) => warnings.push(message) }
+    );
+    assert.equal(close!.closes.toISOString(), "2026-11-17T00:35:59.000Z");
+    assert.match(warnings[0]!, /last known close time.*not JSON/);
+  });
+
+  it("drops a removed lot even with a last known time", async () => {
+    const lastKnown = new Map([
+      [1, new Date("2026-11-17T00:00:00Z")],
+      [2, new Date("2026-11-17T00:00:00Z")],
+    ]);
+    const closes = await resolveWatchlistCloses(
+      [favorite(1), favorite(2)],
+      async (lotId) => {
+        if (lotId === 1) {
+          throw notFound(lotId);
+        }
+        return ok(lotId);
+      },
+      { ...quiet, lastKnown }
+    );
+    assert.deepEqual(
+      closes.map((close) => close.favorite.auction_lot_id),
+      [2]
+    );
+    assert.ok(!lastKnown.has(1));
+  });
+
+  it("still fails loudly when every lot answers badly, last known times or not", async () => {
+    const favorites = [favorite(1), favorite(2), favorite(3)];
+    const lastKnown = new Map(
+      favorites.map((item) => [item.auction_lot_id, new Date("2026-11-17T00:00:00Z")])
+    );
+    await assert.rejects(
+      resolveWatchlistCloses(
+        favorites,
+        async () => {
+          throw new Error("Mac.Bid lot response has no usable end_time; the API may have changed");
+        },
+        { ...quiet, lastKnown }
+      ),
+      /None of the 3 watchlist lots/
+    );
+  });
+
+  it("passes lookups through quietly once another request has signed the client out", async () => {
+    const warnings: string[] = [];
+    let signedIn = true;
+    const error = new Error("Not authenticated");
+    await assert.rejects(
+      resolveWatchlistCloses(
+        [favorite(1), favorite(2), favorite(3)],
+        async () => {
+          // get_active got a 401 meanwhile and the library dropped the session
+          signedIn = false;
+          throw error;
+        },
+        { ...quiet, signedIn: () => signedIn, warn: (message) => warnings.push(message) }
+      ),
+      (thrown) => thrown === error
+    );
+    assert.deepEqual(warnings, []);
+  });
+
   it("forgets lots that are no longer watched", async () => {
     const lastKnown = new Map([[99, new Date("2026-11-01T00:00:00Z")]]);
     await resolveWatchlistCloses([favorite(1)], async (lotId) => ok(lotId), {

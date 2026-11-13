@@ -1,5 +1,6 @@
 import {
   MacBidAuthError,
+  MacBidNotFoundError,
   MacBidUnavailableError,
   type LotStatus,
   type WatchlistFull,
@@ -39,10 +40,17 @@ export interface ResolveOptions {
   warn?: (message: string) => void;
   /**
    * Each lot's last close time read from Mac.Bid, kept between builds. Used
-   * when a lot's lookup is still unavailable after a retry, instead of failing
-   * the build. Updated in place; lots no longer watched are dropped.
+   * when a lot's lookup fails for any reason but a 404 or sign-in, so a passing
+   * error does not delete a known event. Updated in place; lots no longer
+   * watched, or gone from Mac.Bid, are dropped.
    */
   lastKnown?: Map<number, Date>;
+  /**
+   * Whether the client still has a session. When another request's sign-in
+   * failure drops it, lookups fail with a plain "Not authenticated"; those are
+   * passed through quietly instead of logged as skipped lots.
+   */
+  signedIn?: () => boolean;
   /** For tests. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -108,15 +116,18 @@ export async function mapWithConcurrency<T, R>(
 /**
  * Each watchlist item with its lot's real close time.
  *
- * - A lot that cannot be read (removed, or an answer without a usable
- *   `end_time`) is skipped with a warning, as one odd item must not take the
- *   whole feed down.
- * - A lot Mac.Bid is rate-limiting or failing on is retried once; if it still
- *   fails, its last known close time is used, and without one the error is
- *   thrown so the feed keeps its previous events.
+ * - A lot Mac.Bid no longer has (404) is skipped with a warning.
+ * - Any other failure for one lot (a bad answer, a 429 or outage after one
+ *   retry) uses the lot's last known close time. Without one, a bad answer
+ *   skips the lot (one odd item must not take the whole feed down), and an
+ *   outage is thrown so the feed keeps its previous events.
+ * - Once a lot is still rate-limited after its retry, the remaining lots send
+ *   no request: Mac.Bid is limiting us, and more requests (and waits) would
+ *   only hold up the build.
  * - Sign-in errors are thrown as they are, for their usual handling.
- * - If a watchlist of `MIN_LOTS_FOR_API_CHANGE` or more lots has none that can
- *   be read, the lot endpoint has likely changed: that is thrown too.
+ * - If a watchlist of `MIN_LOTS_FOR_API_CHANGE` or more lots has no lot read
+ *   fresh, and not only because of rate limits, the lot endpoint has likely
+ *   changed: that is thrown too.
  *
  * `expected_close_date` is never used as a fallback: it is known to be wrong.
  */
@@ -127,20 +138,39 @@ export async function resolveWatchlistCloses(
     concurrency = LOT_LOOKUP_CONCURRENCY,
     warn = console.warn,
     lastKnown,
+    signedIn,
     sleep = defaultSleep,
   }: ResolveOptions = {}
 ): Promise<WatchlistClose[]> {
+  /** Set once a lot is still unavailable after its retry. */
+  let limited: MacBidUnavailableError | undefined;
+  let fresh = 0;
+  let badAnswers = 0;
+
   const fetchLot = async (lotId: number): Promise<LotStatus> => {
+    if (limited) {
+      throw limited;
+    }
     try {
       return await getLot(lotId);
     } catch (error) {
-      if (!(error instanceof MacBidUnavailableError)) {
+      if (!(error instanceof MacBidUnavailableError) || limited) {
         throw error;
       }
       await sleep(
         Math.min(error.retryAfterMs ?? DEFAULT_RETRY_WAIT_MS, MAX_RETRY_WAIT_MS)
       );
-      return await getLot(lotId);
+      if (limited) {
+        throw limited;
+      }
+      try {
+        return await getLot(lotId);
+      } catch (retryError) {
+        if (retryError instanceof MacBidUnavailableError) {
+          limited ??= retryError;
+        }
+        throw retryError;
+      }
     }
   };
 
@@ -154,27 +184,48 @@ export async function resolveWatchlistCloses(
         // get_lot has checked end_time is an ISO instant with a zone
         const closes = new Date(lot.end_time);
         lastKnown?.set(lotId, closes);
+        fresh++;
         return { favorite, closes };
       } catch (error) {
-        if (error instanceof MacBidAuthError) {
+        if (
+          error instanceof MacBidAuthError ||
+          (signedIn && !signedIn())
+        ) {
+          // Signed out (here or by another request): the build becomes the
+          // sign-in reminder, so these are not lot problems worth logging
           throw error;
         }
         const reason = error instanceof Error ? error.message : String(error);
-        if (error instanceof MacBidUnavailableError) {
-          const previous = lastKnown?.get(lotId);
-          if (!previous) {
-            throw error;
+        if (error instanceof MacBidNotFoundError) {
+          lastKnown?.delete(lotId);
+          badAnswers++;
+          warn(`Skipping watchlist item ${lotId}: ${reason}`);
+          return null;
+        }
+        const unavailable = error instanceof MacBidUnavailableError;
+        if (!unavailable) {
+          badAnswers++;
+        }
+        const previous = lastKnown?.get(lotId);
+        if (previous) {
+          // Rate-limited lots are summed up once below, not one line each
+          if (!unavailable) {
+            warn(`Watchlist item ${lotId}: using its last known close time (${reason})`);
           }
-          warn(
-            `Watchlist item ${lotId}: using its last known close time (${reason})`
-          );
           return { favorite, closes: previous };
+        }
+        if (unavailable) {
+          throw error;
         }
         warn(`Skipping watchlist item ${lotId}: ${reason}`);
         return null;
       }
     }
   );
+
+  if (limited) {
+    warn(`Mac.Bid is rate-limiting lot lookups (${limited.message}); using last known close times`);
+  }
 
   if (lastKnown) {
     const watched = new Set(favorites.map((favorite) => favorite.auction_lot_id));
@@ -185,11 +236,10 @@ export async function resolveWatchlistCloses(
     }
   }
 
-  const closes = looked.filter((item): item is WatchlistClose => item !== null);
-  if (favorites.length >= MIN_LOTS_FOR_API_CHANGE && closes.length === 0) {
+  if (favorites.length >= MIN_LOTS_FOR_API_CHANGE && fresh === 0 && badAnswers > 0) {
     throw new Error(
       `None of the ${favorites.length} watchlist lots could be looked up; the Mac.Bid lot API may have changed`
     );
   }
-  return closes;
+  return looked.filter((item): item is WatchlistClose => item !== null);
 }

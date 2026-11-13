@@ -480,6 +480,7 @@ function activeEmailHint(
             api.get_watchlist().then((favorites) =>
               resolveWatchlistCloses(favorites, api.get_lot, {
                 lastKnown: lastKnownCloses,
+                signedIn: () => !!api.getAuthState().token,
               })
             ),
             api.get_active(),
