@@ -9,11 +9,13 @@ import {
 } from "macbid-ts-api";
 import {
   LOT_LOOKUP_CONCURRENCY,
+  MAX_FALLBACK_AGE_MS,
   MAX_RETRY_WAIT_MS,
   MIN_LOTS_FOR_API_CHANGE,
   mapWithConcurrency,
   resolveWatchlistCloses,
   settleAll,
+  type KnownClose,
 } from "./watchlistCloseTimes.js";
 
 // Lot 2230R (Magnet Maker), as Mac.Bid answered on 13 Nov 2026. The site shows
@@ -43,6 +45,10 @@ const notFound = (lotId: number) =>
   });
 
 const noSleep = async () => undefined;
+const known = (iso: string, readAt = Date.now()): KnownClose => ({
+  closes: new Date(iso),
+  readAt,
+});
 const quiet = { warn: () => undefined, sleep: noSleep };
 const ok = (lotId: number) => lotStatus(lotId, "2026-11-17T00:35:59.000Z");
 const unavailable = (retryAfterMs?: number) =>
@@ -225,12 +231,12 @@ describe("resolveWatchlistCloses", () => {
   });
 
   it("uses the last known close time when a lot stays unavailable", async () => {
-    const lastKnown = new Map<number, Date>();
+    const lastKnown = new Map<number, KnownClose>();
     await resolveWatchlistCloses([MAGNET_MAKER, favorite(2)], async (lotId) => ok(lotId), {
       ...quiet,
       lastKnown,
     });
-    assert.equal(lastKnown.get(67826120)?.toISOString(), "2026-11-17T00:35:59.000Z");
+    assert.equal(lastKnown.get(67826120)?.closes.toISOString(), "2026-11-17T00:35:59.000Z");
 
     const warnings: string[] = [];
     const closes = await resolveWatchlistCloses(
@@ -273,7 +279,7 @@ describe("resolveWatchlistCloses", () => {
   it("stops sending requests once a lot is still rate-limited after its retry", async () => {
     const favorites = Array.from({ length: 12 }, (_, index) => favorite(index + 1));
     const lastKnown = new Map(
-      favorites.map((item) => [item.auction_lot_id, new Date("2026-11-17T00:00:00Z")])
+      favorites.map((item) => [item.auction_lot_id, known("2026-11-17T00:00:00Z")])
     );
     let calls = 0;
     let waits = 0;
@@ -305,7 +311,7 @@ describe("resolveWatchlistCloses", () => {
   it("does not treat a rate limit as an API change", async () => {
     const favorites = [favorite(1), favorite(2), favorite(3)];
     const lastKnown = new Map(
-      favorites.map((item) => [item.auction_lot_id, new Date("2026-11-17T00:00:00Z")])
+      favorites.map((item) => [item.auction_lot_id, known("2026-11-17T00:00:00Z")])
     );
     const closes = await resolveWatchlistCloses(
       favorites,
@@ -318,7 +324,7 @@ describe("resolveWatchlistCloses", () => {
   });
 
   it("keeps a lot's last known time through a passing bad answer", async () => {
-    const lastKnown = new Map([[67826120, new Date("2026-11-17T00:35:59.000Z")]]);
+    const lastKnown = new Map([[67826120, known("2026-11-17T00:35:59.000Z")]]);
     const warnings: string[] = [];
     const [close] = await resolveWatchlistCloses(
       [MAGNET_MAKER],
@@ -333,8 +339,8 @@ describe("resolveWatchlistCloses", () => {
 
   it("drops a removed lot even with a last known time", async () => {
     const lastKnown = new Map([
-      [1, new Date("2026-11-17T00:00:00Z")],
-      [2, new Date("2026-11-17T00:00:00Z")],
+      [1, known("2026-11-17T00:00:00Z")],
+      [2, known("2026-11-17T00:00:00Z")],
     ]);
     const closes = await resolveWatchlistCloses(
       [favorite(1), favorite(2)],
@@ -356,7 +362,7 @@ describe("resolveWatchlistCloses", () => {
   it("still fails loudly when every lot answers badly, last known times or not", async () => {
     const favorites = [favorite(1), favorite(2), favorite(3)];
     const lastKnown = new Map(
-      favorites.map((item) => [item.auction_lot_id, new Date("2026-11-17T00:00:00Z")])
+      favorites.map((item) => [item.auction_lot_id, known("2026-11-17T00:00:00Z")])
     );
     await assert.rejects(
       resolveWatchlistCloses(
@@ -389,8 +395,72 @@ describe("resolveWatchlistCloses", () => {
     assert.deepEqual(warnings, []);
   });
 
+  it("does not count a removed lot during a rate limit as an API change", async () => {
+    const lastKnown = new Map([
+      [2, known("2026-11-17T00:00:00Z")],
+      [3, known("2026-11-17T00:00:00Z")],
+    ]);
+    const closes = await resolveWatchlistCloses(
+      [favorite(1), favorite(2), favorite(3)],
+      async (lotId) => {
+        if (lotId === 1) {
+          throw notFound(lotId);
+        }
+        throw unavailable();
+      },
+      { ...quiet, lastKnown, concurrency: 1 }
+    );
+    assert.deepEqual(
+      closes.map((close) => close.favorite.auction_lot_id),
+      [2, 3]
+    );
+  });
+
+  it("stops standing in with a saved time once it is too old", async () => {
+    const readAt = Date.parse("2026-11-16T12:00:00Z");
+    let clock = readAt + MAX_FALLBACK_AGE_MS;
+    const lastKnown = new Map([[67826120, known("2026-11-17T00:35:59.000Z", readAt)]]);
+    const badAnswer = async () => {
+      throw new Error("Mac.Bid lot response has no usable end_time; the API may have changed");
+    };
+    const options = { ...quiet, lastKnown, now: () => clock };
+
+    // Still within the limit: the saved time is used
+    const [close] = await resolveWatchlistCloses([MAGNET_MAKER], badAnswer, options);
+    assert.equal(close!.closes.toISOString(), "2026-11-17T00:35:59.000Z");
+
+    // Past it: a bad answer skips the lot, and the saved time is forgotten
+    clock += 1;
+    assert.deepEqual(await resolveWatchlistCloses([MAGNET_MAKER], badAnswer, options), []);
+    assert.ok(!lastKnown.has(67826120));
+
+    // Past it, a rate limit fails the build, so calendar apps keep their copy
+    lastKnown.set(67826120, known("2026-11-17T00:35:59.000Z", readAt));
+    const error = unavailable();
+    await assert.rejects(
+      resolveWatchlistCloses(
+        [MAGNET_MAKER],
+        async () => {
+          throw error;
+        },
+        options
+      ),
+      (thrown) => thrown === error
+    );
+  });
+
+  it("dates a saved time from when it was read", async () => {
+    const lastKnown = new Map<number, KnownClose>();
+    await resolveWatchlistCloses([MAGNET_MAKER], async (lotId) => ok(lotId), {
+      ...quiet,
+      lastKnown,
+      now: () => 1234,
+    });
+    assert.equal(lastKnown.get(67826120)?.readAt, 1234);
+  });
+
   it("forgets lots that are no longer watched", async () => {
-    const lastKnown = new Map([[99, new Date("2026-11-01T00:00:00Z")]]);
+    const lastKnown = new Map([[99, known("2026-11-01T00:00:00Z")]]);
     await resolveWatchlistCloses([favorite(1)], async (lotId) => ok(lotId), {
       ...quiet,
       lastKnown,

@@ -53,7 +53,11 @@ import {
 } from "./dataDir.js";
 import { loadTlsMaterials } from "./tls.js";
 import { appVersion } from "./version.js";
-import { resolveWatchlistCloses, settleAll } from "./watchlistCloseTimes.js";
+import {
+  resolveWatchlistCloses,
+  settleAll,
+  type KnownClose,
+} from "./watchlistCloseTimes.js";
 
 // Load a local .env when there is one (development); containers pass real env vars
 try {
@@ -149,7 +153,7 @@ function activeEmailHint(
   let pendingFeed: Promise<FeedResult> | undefined;
   // Each watched lot's last close time from Mac.Bid, for when a lookup is
   // rate-limited (see watchlistCloseTimes.ts)
-  const lastKnownCloses = new Map<number, Date>();
+  const lastKnownCloses = new Map<number, KnownClose>();
 
   // Feed builds, sign-in and startup all share one Mac.Bid client and the
   // saved auth state. Run them one at a time so none sees another's half-done
