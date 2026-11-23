@@ -14,7 +14,7 @@
         "node": "22 || >=24"
     },
     "dependencies": {
-        "ical-generator": "^11.1.3",
+        "ical-generator": "^11.1.4",
         "macbid-ts-api": "^2.1.0"
     },
     "devDependencies": {
